@@ -38,7 +38,7 @@ The source installer remains available for per-user installations.
 
 The existing `~/.local/bin/syslogapp`, user desktop entry, and user applet can
 shadow their system-installed replacements. Before switching to Debian packages,
-close SysLogApp, remove its applet from the panel, then run `./uninstall.sh` from
+close SysLogApp, remove its applet from the panel, then run `bash ./uninstall.sh` from
 the source folder. It retains preferences. Remove the old user applet folder only
 if it is your SysLogApp applet, then install the packages and optionally enable
 the system applet. Do not run the source installer again over a package install.

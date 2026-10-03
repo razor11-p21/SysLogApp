@@ -44,7 +44,7 @@ installation, maintenance limitations, and validation scope. Build packages with
 Run this workspace copy without installing it:
 
 ```bash
-./run-preview.sh
+bash ./run-preview.sh
 ```
 
 Regression checks (GTK bindings are required to run the UI behavior tests):
@@ -174,7 +174,7 @@ For a per-user installation, extract the Preview 19 source archive and run:
 
 ```bash
 cd SysLogApp-2.0.0~preview19-1
-./install.sh
+bash ./install.sh
 ```
 
 Then launch with:
