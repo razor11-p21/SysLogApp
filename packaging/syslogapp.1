@@ -1,0 +1,30 @@
+.TH SYSLOGAPP 1 "October 2026" "SysLogApp Preview 19" "User Commands"
+.SH NAME
+syslogapp \- Linux system health and troubleshooting desktop application
+.SH SYNOPSIS
+.B syslogapp
+.SH DESCRIPTION
+SysLogApp is a GTK3 desktop application for resource monitoring, journal logs,
+network inspection, diagnostics, and explicit maintenance on systemd-based
+Linux Mint and Ubuntu systems.
+.PP
+The application runs as the current user. Administrative maintenance actions
+request authorization through PolicyKit. Journal visibility and socket ownership
+information depend on the user's permissions.
+.PP
+Administrative actions do not have a fixed execution timeout. Allow them to
+finish before closing the application. Package recovery requiring interactive
+input must be completed in a terminal.
+.SH FILES
+.TP
+.I ~/.config/syslogapp/config.json
+User preferences. Package installation and removal do not modify this file.
+.SH LICENSE
+GNU General Public License, version 3 or any later version.
+.SH AUTHOR
+pit pitopoulos.
+.SH SEE ALSO
+.BR journalctl (1),
+.BR systemctl (1),
+.BR ip (8),
+.BR pkexec (1)

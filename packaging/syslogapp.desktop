@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=SysLogApp
+Comment=System health, logs, and network diagnostics
+Exec=/usr/bin/syslogapp
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
+StartupWMClass=SysLogApp
