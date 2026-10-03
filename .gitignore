@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+backups/
+dist/
+dashboard-concept.png
+*.log
