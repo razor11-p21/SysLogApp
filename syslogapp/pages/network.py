@@ -1,1051 +1,581 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 pit pitopoulos
-from collections import deque
-from datetime import datetime
+from collections import Counter
+import socket
 
-from gi.repository import Gtk, GLib, Gdk, Pango
-
-from ..services import network_overview, human_bytes
-from ..widgets import MetricCard, SectionCard, StatusPill, ResponsiveColumns, WrappingToolbar
-
-
-def human_rate(value):
-    try:
-        value = max(0.0, float(value))
-    except Exception:
-        value = 0.0
-    units = ("B/s", "KB/s", "MB/s", "GB/s")
-    for unit in units:
-        if value < 1024.0 or unit == units[-1]:
-            if unit in ("MB/s", "GB/s"):
-                return f"{value:.1f} {unit}"
-            if unit == "KB/s":
-                return f"{value:.0f} {unit}"
-            return f"{value:.0f} {unit}"
-        value /= 1024.0
-    return "0 B/s"
+from gi.repository import Gtk, Gdk, Pango, GLib
+from ..widgets import CommandBar, action_menu, ColumnSizing, TableTextAccess, selectable_readouts
+from ..config import column_widths
+from ..network import snapshot, host_lan_ip
+from ..sorting import network_field_key, network_display_row, compare
 
 
-class TrafficGraph(Gtk.DrawingArea):
-    """Small dynamic RX/TX traffic graph with an adaptive scale."""
-
-    def __init__(self, max_points=60):
-        super().__init__()
-        self.rx = deque([0.0] * max_points, maxlen=max_points)
-        self.tx = deque([0.0] * max_points, maxlen=max_points)
-        self.set_size_request(-1, 180)
-        self.connect("draw", self._draw)
-
-    def add_values(self, rx, tx):
-        try:
-            rx = max(0.0, float(rx))
-        except Exception:
-            rx = 0.0
-        try:
-            tx = max(0.0, float(tx))
-        except Exception:
-            tx = 0.0
-        self.rx.append(rx)
-        self.tx.append(tx)
-        self.queue_draw()
-
-    def _rgba(self, name, fallback):
-        found, color = self.get_style_context().lookup_color(name)
-        return color if found else fallback
-
-    def _draw_series(self, cr, values, color, x0, y0, width, height, maximum):
-        vals = list(values)
-        if len(vals) < 2:
-            return
-        step = width / max(1, len(vals) - 1)
-        cr.set_source_rgba(color.red, color.green, color.blue, color.alpha)
-        cr.set_line_width(2.0)
-        for idx, val in enumerate(vals):
-            x = x0 + idx * step
-            y = y0 + height - min(1.0, val / maximum) * height
-            if idx == 0:
-                cr.move_to(x, y)
-            else:
-                cr.line_to(x, y)
-        cr.stroke()
-
-    def _draw(self, _widget, cr):
-        alloc = self.get_allocation()
-        width, height = max(1, alloc.width), max(1, alloc.height)
-        left, right, top, bottom = 76, 14, 12, 26
-        gw = max(1, width - left - right)
-        gh = max(1, height - top - bottom)
-
-        grid = self._rgba("graph_grid", Gdk.RGBA(0.45, 0.5, 0.56, 0.3))
-        text = self._rgba("graph_text", Gdk.RGBA(0.55, 0.6, 0.66, 1.0))
-        rx_color = self._rgba("graph_rx", Gdk.RGBA(0.35, 0.64, 1.0, 1.0))
-        tx_color = self._rgba("graph_tx", Gdk.RGBA(0.35, 0.82, 0.52, 1.0))
-
-        maximum = max(max(self.rx, default=0.0), max(self.tx, default=0.0), 1024.0)
-        # Add headroom and round to a stable binary-ish scale.
-        maximum *= 1.15
-        step = 1024.0
-        while step < maximum:
-            step *= 2.0
-        maximum = step
-
-        cr.set_line_width(1)
-        cr.select_font_face("Sans", 0, 0)
-        cr.set_font_size(10)
-        for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
-            y = top + gh - frac * gh
-            cr.set_source_rgba(grid.red, grid.green, grid.blue, grid.alpha)
-            cr.move_to(left, y)
-            cr.line_to(left + gw, y)
-            cr.stroke()
-            cr.set_source_rgba(text.red, text.green, text.blue, text.alpha)
-            cr.move_to(2, y + 4)
-            cr.show_text(human_rate(maximum * frac))
-
-        self._draw_series(cr, self.rx, rx_color, left, top, gw, gh, maximum)
-        self._draw_series(cr, self.tx, tx_color, left, top, gw, gh, maximum)
-        return False
+# Shared terminal palette: colors describe state, not a claim of health.
+BLUE = '#6aa8ff'
+AMBER = '#ffb34c'
+RED = '#ff8188'
+GRAY = '#9aa8b7'
+PURPLE = '#b69cff'
+STATE_COLORS = {'ESTAB': BLUE, 'LISTEN': PURPLE, 'UNCONN': GRAY,
+                'SYN-SENT': PURPLE, 'SYN-RECV': PURPLE, 'TIME-WAIT': GRAY,
+                'FIN-WAIT-1': GRAY, 'FIN-WAIT-2': GRAY, 'CLOSE-WAIT': AMBER,
+                'LAST-ACK': GRAY, 'CLOSING': GRAY, 'CLOSE': GRAY}
+STATE_TEXT_COLORS = {'ESTAB': '#c6d4c9', 'LISTEN': '#c2afff',
+                     'SYN-SENT': '#c2afff', 'SYN-RECV': '#c2afff', 'CLOSE-WAIT': '#f6bd67'}
 
 
-class NetworkPage(Gtk.ScrolledWindow):
-    COL_KEY = 0
-    COL_PROTOCOL = 1
-    COL_PROCESS = 2
-    COL_LOCAL = 3
-    COL_REMOTE = 4
-    COL_STATE = 5
-    COL_PID = 6
-    COL_FAMILY = 7
-    COL_LISTENING = 8
-    COL_SCOPE = 9
-    COL_INTERFACE = 10
-    COL_USER = 11
-    COL_EXE = 12
-    COL_LOCAL_IP = 13
-    COL_LOCAL_PORT = 14
-    COL_REMOTE_IP = 15
-    COL_REMOTE_PORT = 16
-
+class NetworkPage(Gtk.Box):
+    LIVE_SECONDS = 2
+    HEADERS = ('Proto', 'State', 'Local address', 'Local port', 'Remote address', 'Remote port', 'PID', 'Process')
+    DISPLAY_ORDER = (0, 1, 2, 3, 4, 5, 7, 6)
+    SORT_FIELDS = {column: (column,) + tuple(index for index in (1, 0, 2, 3, 4, 5, 6, 7)
+                                            if index != column) for column in range(8)}
     def __init__(self, app):
-        super().__init__()
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.app = app
-        self.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.get_style_context().add_class("page-scroll")
-
-        self._timer = None
+        self.host = getattr(app, "host", None)
+        self.set_border_width(8)
         self._busy = False
-        self._paused = False
-        self._refresh_serial = 0
+        self._destroyed = False
+        self._loaded_once = False
+        self._rows = []
+        self._column_chars = [max(map(len, header.split())) for header in self.HEADERS]
+        self._display_signature = ()
         self._snapshot = None
-        self._previous_io = None
-        self._rx_rate = 0.0
-        self._tx_rate = 0.0
-        self._selected_key = None
-        self._detail_row = None
-        self._column_resize_source = {}
-        self._tree_layout = {}
-
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        root.set_border_width(22)
-        self.add(root)
-
-        root.pack_start(self._build_heading(), False, False, 0)
-        root.pack_start(self._build_metrics(), False, False, 0)
-        root.pack_start(self._build_traffic(), False, False, 0)
-        root.pack_start(self._build_explorer(), True, True, 0)
-
-        self.updated_label = Gtk.Label(label="", xalign=1)
-        self.updated_label.get_style_context().add_class("footer-text")
-        root.pack_start(self.updated_label, False, False, 0)
-
-        self.connect("map", self._on_map)
-        self.connect("unmap", self._on_unmap)
-        self.connect("destroy", self._on_destroy)
-
-    def _build_heading(self):
-        heading = ResponsiveColumns()
-        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        title = Gtk.Label(label="Network", xalign=0)
-        title.get_style_context().add_class("page-title")
-        subtitle = Gtk.Label(label="Monitor interfaces, traffic, active connections, and listening ports.", xalign=0)
-        subtitle.set_line_wrap(True)
-        subtitle.set_max_width_chars(55)
-        subtitle.get_style_context().add_class("page-subtitle")
-        text.pack_start(title, False, False, 0)
-        text.pack_start(subtitle, False, False, 0)
-        heading.pack_start(text, True, True, 0)
-
-        # Fixed-width controls prevent live state changes from moving the header.
-        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.pause_btn = Gtk.Button(label="Pause")
-        self.pause_btn.set_size_request(104, -1)
-        self.pause_btn.get_style_context().add_class("secondary-button")
-        self.pause_btn.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
-        self.pause_btn.set_always_show_image(True)
-        self.pause_btn.connect("clicked", self._toggle_pause)
-        controls.pack_start(self.pause_btn, False, False, 0)
-
-        self.refresh_btn = Gtk.Button(label="Refresh Now")
-        self.refresh_btn.set_size_request(136, -1)
-        self.refresh_btn.get_style_context().add_class("secondary-button")
-        self.refresh_btn.set_image(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON))
-        self.refresh_btn.set_always_show_image(True)
-        self.refresh_btn.connect("clicked", lambda *_: self.refresh(force=True))
-        controls.pack_start(self.refresh_btn, False, False, 0)
-
-        self.live_pill = StatusPill("Live • 2s", "ok")
-        self.live_pill.set_size_request(112, -1)
-        controls.pack_start(self.live_pill, False, False, 0)
-        heading.pack_start(controls, False, False, 0)
-        return heading
-
-    def _build_metrics(self):
-        grid = Gtk.FlowBox()
-        grid.set_selection_mode(Gtk.SelectionMode.NONE)
-        grid.set_homogeneous(True)
-        grid.set_min_children_per_line(1)
-        grid.set_max_children_per_line(5)
-        grid.set_column_spacing(12)
-        grid.set_row_spacing(12)
-        self.cards = {
-            "interface": MetricCard("Primary Interface", "network-wired-symbolic", "blue"),
-            "download": MetricCard("Download", "go-down-symbolic", "blue"),
-            "upload": MetricCard("Upload", "go-up-symbolic", "green"),
-            "connections": MetricCard("Established", "network-transmit-receive-symbolic", "purple"),
-            "listening": MetricCard("Listening", "network-server-symbolic", "orange"),
-        }
-        for idx, key in enumerate(("interface", "download", "upload", "connections", "listening")):
-            grid.add(self.cards[key])
-        return grid
-
-    def _build_traffic(self):
-        card = SectionCard("Live Traffic", "Receive and transmit rates over the last two minutes.", "network-transmit-receive-symbolic")
-        legend = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-        self.rx_legend = Gtk.Label(label="● RX 0 B/s")
-        self.rx_legend.get_style_context().add_class("network-rx")
-        self.tx_legend = Gtk.Label(label="● TX 0 B/s")
-        self.tx_legend.get_style_context().add_class("network-tx")
-        legend.pack_start(self.rx_legend, False, False, 0)
-        legend.pack_start(self.tx_legend, False, False, 0)
-        card.header_extra.pack_start(legend, False, False, 0)
-        self.traffic_graph = TrafficGraph(max_points=60)
-        card.content.pack_start(self.traffic_graph, True, True, 0)
-        return card
-
-    def _build_explorer(self):
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-
-        toolbar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        toolbar.get_style_context().add_class("toolbar-card")
-        toolbar.set_border_width(10)
-
-        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._reflow_source = 0
+        self._live_source = 0
+        self._generation = 0
+        self._failures = 0
+        self._last_error = None
+        self._layout_key = None
+        self._has_fitted_snapshot = False
+        self.command_bar = CommandBar()
+        toolbar = self.command_bar.primary
+        self.live = Gtk.ToggleButton(label='Live')
+        self.live.set_active(True)
+        self.live.get_style_context().add_class('active-live')
+        self.live.set_image(Gtk.Image.new_from_icon_name('media-playback-start-symbolic', Gtk.IconSize.BUTTON))
+        self.live.set_always_show_image(True)
+        self.live.set_tooltip_text('Refresh every 2 seconds while Network is visible; starts automatically when opened')
+        self.live.connect('toggled', self._on_live)
+        toolbar.add(self.live)
         self.search = Gtk.SearchEntry()
-        self.search.set_placeholder_text("Search process, IP address, port, PID, user, or interface…")
+        self.search.set_placeholder_text('Search loaded sockets…')
+        self.search.connect('search-changed', lambda *_: self._filter())
         self.search.set_hexpand(True)
-        self.search.connect("search-changed", lambda *_: self._render_tables())
-        search_row.pack_start(self.search, True, True, 0)
-        self.count_label = Gtk.Label(label="Loading…", xalign=1)
-        self.count_label.set_size_request(170, -1)
-        self.count_label.get_style_context().add_class("muted")
-        search_row.pack_end(self.count_label, False, False, 4)
-        toolbar.pack_start(search_row, False, False, 0)
+        self.search.set_width_chars(12)
+        self.command_bar.secondary.pack_start(self.search, True, True, 0)
+        self.kind = Gtk.ComboBoxText()
+        for label in ('All sockets', 'Connections', 'Listening / unconnected'):
+            self.kind.append_text(label)
+        self.kind.set_active(1)
+        self.kind.connect('changed', lambda *_: self._filter())
+        toolbar.add(self.kind)
+        self.hide_time_wait = Gtk.CheckButton(label='Hide TIME-WAIT')
+        self.hide_time_wait.set_tooltip_text('Hide closed TCP sockets waiting to expire; filters loaded rows without another scan')
+        self.hide_time_wait.connect('toggled', lambda *_: self._filter())
+        toolbar.add(self.hide_time_wait)
+        # Keep the selected host identity at the right edge of the Live row.
+        identity = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        hostname = (getattr(self.host, 'hostname', None) or getattr(self.host, 'profile', {}).get('hostname') or 'Remote host') if self.host else socket.gethostname()
+        self.host_name_label = Gtk.Label(xalign=1)
+        self.host_name_label.set_markup(f'<span foreground="{PURPLE}" weight="bold">{GLib.markup_escape_text(hostname)}</span>')
+        self.host_name_label.set_max_width_chars(26)
+        self.host_name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.host_name_label.set_tooltip_text(hostname)
+        self.host_ip_label = Gtk.Label(label='IP: waiting for snapshot', xalign=1)
+        self.host_ip_label.set_max_width_chars(26)
+        self.host_ip_label.set_ellipsize(Pango.EllipsizeMode.END)
+        identity.pack_start(self.host_name_label, False, False, 0)
+        identity.pack_start(self.host_ip_label, False, False, 0)
+        primary_row = Gtk.Box(spacing=12)
+        self.command_bar.remove(toolbar)
+        toolbar.set_hexpand(True)
+        primary_row.pack_start(toolbar, True, True, 0)
+        primary_row.pack_end(identity, False, False, 4)
+        self.command_bar.pack_start(primary_row, False, False, 0)
+        self.command_bar.reorder_child(primary_row, 0)
 
-        filter_row = WrappingToolbar()
-        self.protocol = Gtk.ComboBoxText()
-        for value in ("All Protocols", "TCP", "UDP"):
-            self.protocol.append_text(value)
-        self.protocol.set_active(0)
-        self.protocol.connect("changed", lambda *_: self._render_tables())
-        filter_row.add(self.protocol)
-
-        self.scope = Gtk.ComboBoxText()
-        for value in ("All Scopes", "Local", "LAN", "Internet", "Unknown"):
-            self.scope.append_text(value)
-        self.scope.set_active(0)
-        self.scope.connect("changed", lambda *_: self._render_tables())
-        filter_row.add(self.scope)
-
-        self.state = Gtk.ComboBoxText()
-        for value in ("All States", "ESTABLISHED", "SYN_SENT", "SYN_RECV", "CLOSE_WAIT", "TIME_WAIT"):
-            self.state.append_text(value)
-        self.state.set_active(0)
-        self.state.connect("changed", lambda *_: self._render_tables())
-        filter_row.add(self.state)
-
-        clear_btn = Gtk.Button(label="Clear Filters")
-        clear_btn.get_style_context().add_class("secondary-button")
-        clear_btn.connect("clicked", self._clear_filters)
-        filter_row.add(clear_btn)
-        toolbar.pack_start(filter_row, False, False, 0)
-        outer.pack_start(toolbar, False, False, 0)
-
-        self.view_stack = Gtk.Stack()
-        self.view_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        self.view_stack.set_transition_duration(120)
-        switcher = Gtk.StackSwitcher()
-        switcher.set_stack(self.view_stack)
-        switcher.set_halign(Gtk.Align.START)
-        switcher.get_style_context().add_class("network-switcher")
-        outer.pack_start(switcher, False, False, 0)
-
-        self.view_stack.add_titled(self._build_connections_view(), "connections", "Live Connections")
-        self.view_stack.add_titled(self._build_listeners_view(), "listeners", "Listening Ports")
-        self.view_stack.add_titled(self._build_interfaces_view(), "interfaces", "Interfaces")
-        self.view_stack.connect("notify::visible-child-name", self._view_changed)
-        outer.pack_start(self.view_stack, True, True, 0)
-        return outer
-
-    def _new_connection_store(self):
-        return Gtk.ListStore(
-            str, str, str, str, str, str, int, str, bool,
-            str, str, str, str, str, int, str, int,
-        )
-
-    def _build_tree(self, store, listening=False):
-        tree = Gtk.TreeView(model=store)
-        tree.set_headers_visible(True)
-        tree.set_enable_search(False)
-        tree.set_grid_lines(Gtk.TreeViewGridLines.HORIZONTAL)
-        tree.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
-        tree.connect("cursor-changed", self._selection_changed)
-        tree.connect("button-press-event", self._tree_button_press, listening)
-
-        specs = [
-            ("Process", self.COL_PROCESS, "process"),
-            ("Proto", self.COL_PROTOCOL, "proto"),
-            ("Local Address", self.COL_LOCAL, "local"),
-        ]
-        if not listening:
-            specs.extend([
-                ("Remote Address", self.COL_REMOTE, "remote"),
-                ("Scope", self.COL_SCOPE, "scope"),
-                ("State", self.COL_STATE, "state"),
-            ])
-        else:
-            specs.append(("Family", self.COL_FAMILY, "family"))
-        specs.append(("PID", self.COL_PID, "pid"))
-
-        columns = {}
-        for title, model_col, key in specs:
+        self.process_details = Gtk.ComboBoxText()
+        for key, label in (('off', 'Process details: Off'), ('basic', 'Process details: Basic'), ('extended', 'Process details: Extended')):
+            self.process_details.append(key, label)
+        self.process_details.set_active_id('basic')
+        self.process_details.set_tooltip_text('Basic/Extended collect process information on the next refresh. Extended shows full loaded metadata.')
+        self.process_details.connect('changed', self._process_changed)
+        self.command_bar.secondary.pack_start(self.process_details, False, False, 0)
+        self.refresh_btn = Gtk.Button.new_from_icon_name('view-refresh-symbolic', Gtk.IconSize.BUTTON)
+        self.refresh_btn.set_tooltip_text('Refresh network snapshot (F5)')
+        self.refresh_btn.connect('clicked', self._refresh_clicked)
+        self.command_bar.secondary.pack_start(self.refresh_btn, False, False, 0)
+        self.copy = Gtk.MenuItem(label='Copy selected socket')
+        self.copy.set_sensitive(False)
+        self.copy.connect('activate', self._copy)
+        self.more_actions = action_menu([('Fit columns', self._fit_columns)])
+        self.more_actions.get_popup().prepend(self.copy)
+        self.copy.show()
+        self.command_bar.secondary.pack_start(self.more_actions, False, False, 0)
+        self.pack_start(self.command_bar, False, False, 0)
+        # Interface overview is selectable, wrapped text in a bounded-height viewport.
+        self.overview = Gtk.Label(label='Open Network to load a snapshot.', xalign=0, yalign=0)
+        self.overview.set_selectable(True)
+        self.overview.set_line_wrap(True)
+        self.overview.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.overview.set_max_width_chars(1)
+        overview_scroll = Gtk.ScrolledWindow()
+        overview_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        overview_scroll.set_size_request(-1, 100)
+        overview_scroll.add(self.overview)
+        self.overview_expander = Gtk.Expander(label='Interfaces & routes')
+        self.overview_expander.add(overview_scroll)
+        self.pack_start(self.overview_expander, False, False, 0)
+        self.store = Gtk.ListStore(*([str] * 9))
+        for column in range(8):
+            self.store.set_sort_func(column, self._compare_rows, column)
+        self.store.set_sort_column_id(1, Gtk.SortType.ASCENDING)
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.set_enable_search(False)
+        self.tree.get_style_context().add_class('network-table')
+        self.tree.set_has_tooltip(True)
+        self.tree.connect('query-tooltip', self._query_tooltip)
+        self.tree.set_fixed_height_mode(False)
+        self.tree.get_selection().connect('changed', self._selected)
+        self.columns = []
+        self.renderers = []
+        for i, label in enumerate(self.HEADERS):
             renderer = Gtk.CellRendererText()
-            renderer.set_property("ypad", 6)
-            renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
-            col = Gtk.TreeViewColumn(title, renderer, text=model_col)
-            col.set_resizable(False)
+            renderer.set_property('yalign', 0.0)
+            renderer.set_property('ypad', 0)
+            renderer.set_property('xpad', 5)
+            renderer.set_property('wrap-mode', Pango.WrapMode.WORD_CHAR)
+            renderer.set_property('wrap-width', 160)
+            renderer.set_property('xalign', 0.0)
+            renderer.set_property('alignment', Pango.Alignment.LEFT)
+            col = Gtk.TreeViewColumn(label, renderer, text=i)
             col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
-            col.set_min_width(36)
-            # Native ListStore sorting keeps the user's sort choice active across
-            # live refreshes without us reordering the raw snapshot.
-            col.set_sort_column_id(model_col)
-            if model_col == self.COL_STATE:
-                col.set_cell_data_func(renderer, self._state_cell_data)
-            elif model_col == self.COL_SCOPE:
-                col.set_cell_data_func(renderer, self._scope_cell_data)
-            elif model_col == self.COL_PROCESS:
-                col.set_cell_data_func(renderer, self._process_cell_data)
-            elif model_col == self.COL_PID:
-                col.set_cell_data_func(renderer, self._pid_cell_data)
-            tree.append_column(col)
-            columns[key] = col
-
-        self._tree_layout[id(tree)] = {
-            "tree": tree,
-            "columns": columns,
-            "listening": listening,
-            "last_width": 0,
-        }
-        return tree
-
-    def _bind_tree_viewport(self, tree, scroll):
-        # TreeView natural widths are affected by long IPv6 addresses, so size
-        # against the actual viewport instead. Debounce allocations during drag.
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.connect("size-allocate", self._tree_viewport_allocated, tree)
-        GLib.idle_add(self._resize_tree_to_viewport, tree, scroll)
-
-    def _tree_viewport_allocated(self, scroll, allocation, tree):
-        width = max(1, int(allocation.width))
-        layout = self._tree_layout.get(id(tree))
-        if not layout or abs(width - layout.get("last_width", 0)) < 3:
-            return
-        layout["last_width"] = width
-        old = self._column_resize_source.pop(id(tree), None)
-        if old:
-            try:
-                GLib.source_remove(old)
-            except Exception:
-                pass
-        self._column_resize_source[id(tree)] = GLib.timeout_add(35, self._resize_tree_to_viewport, tree, scroll)
-
-    def _resize_tree_to_viewport(self, tree, scroll):
-        self._column_resize_source.pop(id(tree), None)
-        layout = self._tree_layout.get(id(tree))
-        if not layout:
-            return False
-        width = max(1, int(scroll.get_allocated_width()) - 4)
-        if width < 120:
-            return False
-        cols = layout["columns"]
-
-        # Responsive compact columns.  At narrow sizes, process/state/PID give
-        # up space first so endpoints stay useful; full values remain in Details.
-        if layout["listening"]:
-            proto = 58 if width < 760 else 68
-            family = 66 if width < 760 else 82
-            pid = 48 if width < 760 else 62
-            process = max(84, min(165, int(width * 0.20)))
-            local = max(90, width - process - proto - family - pid - 8)
-            sizes = {"process": process, "proto": proto, "local": local, "family": family, "pid": pid}
-        else:
-            proto = 54 if width < 820 else 66
-            scope = 72 if width < 820 else 86
-            state = 78 if width < 820 else 102
-            pid = 44 if width < 820 else 58
-            process = max(78, min(160, int(width * 0.15)))
-            remaining = max(150, width - process - proto - scope - state - pid - 8)
-            local = remaining // 2
-            remote = remaining - local
-            sizes = {
-                "process": process, "proto": proto, "local": local,
-                "remote": remote, "scope": scope, "state": state, "pid": pid,
-            }
-
-        for key, size in sizes.items():
-            col = cols.get(key)
-            if col is not None:
-                col.set_fixed_width(max(36, int(size)))
-        tree.queue_resize()
-        return False
-
-    def _build_connections_view(self):
-        pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        pane.set_wide_handle(True)
-        self.connection_pane = pane
-        self._pane_position_initialized = False
-        pane.connect("size-allocate", self._connection_pane_allocated)
-
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.connection_store = self._new_connection_store()
-        self.connection_tree = self._build_tree(self.connection_store, listening=False)
+            col.set_fixed_width(160)
+            header = Gtk.Label(label=label.replace(' ', '\n'), xalign=0.0)
+            header.set_justify(Gtk.Justification.LEFT)
+            col.set_widget(header)
+            header.show()
+            col.set_alignment(0.0)
+            col.set_sort_column_id(i)
+            col.set_cell_data_func(renderer, self._state_cell, i)
+            self.tree.append_column(col)
+            col.set_visible(i < 6)
+            col.get_button().set_tooltip_text(label + ' — click to sort; drag divider to resize')
+            self.columns.append(col)
+            self.renderers.append(renderer)
+        previous = None
+        for index in self.DISPLAY_ORDER:
+            self.tree.move_column_after(self.columns[index], previous)
+            previous = self.columns[index]
+        # Absorb spare viewport space after the data instead of stretching a port.
+        self.end_space = Gtk.TreeViewColumn('')
+        self.end_space.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        self.end_space.set_fixed_width(16)
+        self.end_space.set_min_width(16)
+        self.end_space.set_expand(True)
+        self.tree.append_column(self.end_space)
+        self.column_sizing = ColumnSizing(self.columns, self.renderers, self._schedule_reflow,
+                                          column_widths(getattr(app, 'config', {}), 'network'))
         scroll = Gtk.ScrolledWindow()
-        self.connection_scroll = scroll
-        scroll.set_min_content_height(360)
-        scroll.add(self.connection_tree)
-        self._bind_tree_viewport(self.connection_tree, scroll)
-        left.pack_start(scroll, True, True, 0)
-        pane.pack1(left, resize=True, shrink=True)
+        self.socket_scroll = scroll
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.connect('size-allocate', self._resize)
+        scroll.add(self.tree)
+        self.pack_start(scroll, True, True, 0)
+        self.status = Gtk.Label(label='Not loaded', xalign=0)
+        self.status.get_style_context().add_class('muted')
+        self.status.set_line_wrap(True)
+        self.pack_end(self.status, False, False, 0)
+        self.text_access = TableTextAccess(
+            self.tree, {self.columns[i]: i for i in self.DISPLAY_ORDER},
+            on_select=self._hold_for_selection, cell_data=self._state_cell)
+        self.socket_scroll.set_margin_bottom(12)
+        selectable_readouts(self)
+        self.connect('map', self._on_map)
+        self.connect('unmap', self._on_unmap)
+        self.connect('destroy', self._on_destroy)
 
-        details = SectionCard("Connection Details", "Select a live socket to inspect it.", "dialog-information-symbolic")
-        details.set_size_request(310, -1)
-        self.detail = Gtk.TextView()
-        self.detail.set_editable(False)
-        self.detail.set_cursor_visible(False)
-        self.detail.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.detail.get_style_context().add_class("detail-text")
-        self.detail.get_buffer().set_text("Select a connection to inspect its endpoints and process information.")
-        dscroll = Gtk.ScrolledWindow()
-        dscroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        dscroll.set_min_content_height(290)
-        dscroll.add(self.detail)
-        details.content.pack_start(dscroll, True, True, 0)
-        actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        copy_btn = Gtk.Button(label="Copy Details")
-        copy_btn.set_image(Gtk.Image.new_from_icon_name("edit-copy-symbolic", Gtk.IconSize.BUTTON))
-        copy_btn.set_always_show_image(True)
-        copy_btn.connect("clicked", self._copy_details)
-        actions.pack_start(copy_btn, False, False, 0)
-        self.filter_process_btn = Gtk.Button(label="Filter Process")
-        self.filter_process_btn.get_style_context().add_class("secondary-button")
-        self.filter_process_btn.set_sensitive(False)
-        self.filter_process_btn.connect("clicked", lambda *_: self._filter_detail_process())
-        actions.pack_start(self.filter_process_btn, False, False, 0)
-        self.filter_remote_btn = Gtk.Button(label="Filter Remote")
-        self.filter_remote_btn.get_style_context().add_class("secondary-button")
-        self.filter_remote_btn.set_sensitive(False)
-        self.filter_remote_btn.connect("clicked", lambda *_: self._filter_detail_remote())
-        actions.pack_start(self.filter_remote_btn, False, False, 0)
-        details.content.pack_start(actions, False, False, 0)
-        note = Gtk.Label(label="Process, username and executable are best-effort without root privileges.", xalign=0)
-        note.set_line_wrap(True)
-        note.get_style_context().add_class("muted")
-        details.content.pack_start(note, False, False, 0)
-        pane.pack2(details, resize=True, shrink=True)
-        return pane
-
-    def _connection_pane_allocated(self, pane, allocation):
-        # Pick a proportional first position once. After that, respect manual
-        # divider movement and let the responsive columns adapt around it.
-        if self._pane_position_initialized or allocation.width < 500:
-            return
-        desired = int(allocation.width * 0.68)
-        desired = max(360, min(desired, allocation.width - 300))
-        pane.set_position(desired)
-        self._pane_position_initialized = True
-
-    def _build_listeners_view(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.listener_store = self._new_connection_store()
-        self.listener_tree = self._build_tree(self.listener_store, listening=True)
-        scroll = Gtk.ScrolledWindow()
-        self.listener_scroll = scroll
-        scroll.set_min_content_height(360)
-        scroll.add(self.listener_tree)
-        self._bind_tree_viewport(self.listener_tree, scroll)
-        box.pack_start(scroll, True, True, 0)
-        hint = Gtk.Label(
-            label="Listening TCP sockets and unconnected UDP endpoints are shown here. Process ownership is best-effort without root privileges.",
-            xalign=0,
-        )
-        hint.set_line_wrap(True)
-        hint.get_style_context().add_class("muted")
-        box.pack_start(hint, False, False, 4)
-        return box
-
-    def _build_interfaces_view(self):
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.interfaces_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.interfaces_box.set_border_width(2)
-        scroll.add(self.interfaces_box)
-        return scroll
-
-    def _state_color(self, state):
-        dark = self._is_dark_theme()
-        palette = {
-            "ESTABLISHED": "#45cf7a" if dark else "#14804a",
-            "LISTEN": "#6aa8ff" if dark else "#175cd3",
-            "SYN_SENT": "#ffb34c" if dark else "#b54708",
-            "SYN_RECV": "#ffb34c" if dark else "#b54708",
-            "CLOSE_WAIT": "#ff8a65" if dark else "#c2410c",
-            "TIME_WAIT": "#9aa8b7" if dark else "#667085",
-            "NONE": "#9aa8b7" if dark else "#667085",
-        }
-        return palette.get(state, palette["NONE"])
-
-    def _is_dark_theme(self):
-        settings = Gtk.Settings.get_default()
-        try:
-            return bool(settings.get_property("gtk-application-prefer-dark-theme")) if settings else False
-        except Exception:
-            return False
-
-    def _state_cell_data(self, _column, cell, model, itr, _data=None):
-        state = model.get_value(itr, self.COL_STATE)
-        cell.set_property("text", state)
-        cell.set_property("foreground", self._state_color(state))
-        cell.set_property("weight", Pango.Weight.BOLD if state in ("ESTABLISHED", "CLOSE_WAIT", "SYN_SENT", "SYN_RECV") else Pango.Weight.NORMAL)
-
-    def _scope_color(self, scope):
-        dark = self._is_dark_theme()
-        palette = {
-            "Local": "#b69cff" if dark else "#6941c6",
-            "LAN": "#6aa8ff" if dark else "#175cd3",
-            "Internet": "#45cf7a" if dark else "#14804a",
-            "Unknown": "#9aa8b7" if dark else "#667085",
-        }
-        return palette.get(scope, palette["Unknown"])
-
-    def _scope_cell_data(self, _column, cell, model, itr, _data=None):
-        scope = model.get_value(itr, self.COL_SCOPE) or "Unknown"
-        cell.set_property("text", scope)
-        cell.set_property("foreground", self._scope_color(scope))
-        cell.set_property("weight", Pango.Weight.BOLD if scope in ("LAN", "Internet") else Pango.Weight.NORMAL)
-
-    def _process_cell_data(self, _column, cell, model, itr, _data=None):
-        process = model.get_value(itr, self.COL_PROCESS)
-        cell.set_property("text", process)
-        if process == "—":
-            cell.set_property("foreground", "#9aa8b7" if self._is_dark_theme() else "#667085")
-            cell.set_property("style", Pango.Style.ITALIC)
-        else:
-            cell.set_property("foreground-set", False)
-            cell.set_property("style", Pango.Style.NORMAL)
-
-    def _pid_cell_data(self, _column, cell, model, itr, _data=None):
-        pid = model.get_value(itr, self.COL_PID)
-        cell.set_property("text", str(pid) if pid else "—")
-        cell.set_property("foreground-set", False)
-
-    def _view_changed(self, *_):
-        visible = self.view_stack.get_visible_child_name() or "connections"
-        on_connections = visible == "connections"
-        on_listeners = visible == "listeners"
-        self.search.set_sensitive(on_connections or on_listeners)
-        self.protocol.set_sensitive(on_connections or on_listeners)
-        self.scope.set_sensitive(on_connections)
-        self.state.set_sensitive(on_connections)
-        self._render_tables()
-        if visible == "interfaces":
-            self._render_interfaces()
+    def _hold_for_selection(self):
+        if self.live.get_active():
+            self.live.set_active(False)
 
     def _on_map(self, *_):
-        # Returning to a deliberately paused Network page must not silently
-        # replace the frozen snapshot.  First use still gets an initial sample.
-        if not self._paused or self._snapshot is None:
-            self.refresh(force=True)
-        if self._timer is None:
-            self._timer = GLib.timeout_add_seconds(2, self._tick)
+        if self._live_allowed():
+            self.refresh(automatic=True)
+        elif not self.live.get_active() and not self._loaded_once:
+            self.refresh()
+        self._update_status()
 
     def _on_unmap(self, *_):
-        if self._timer is not None:
-            GLib.source_remove(self._timer)
-            self._timer = None
+        # Discard an in-flight automatic result too, leaving a stable hidden view.
+        self._generation += 1
+        self._cancel_live_timer()
+        if self._snapshot is None:
+            self._loaded_once = False
+
+    def _cancel_live_timer(self):
+        if self._live_source:
+            GLib.source_remove(self._live_source)
+            self._live_source = 0
+
+    def stop_live(self):
+        self._generation += 1
+        self._cancel_live_timer()
 
     def _on_destroy(self, *_):
-        self._on_unmap()
-        for source_id in list(self._column_resize_source.values()):
-            try:
-                GLib.source_remove(source_id)
-            except Exception:
-                pass
-        self._column_resize_source.clear()
+        self._destroyed = True
+        self.column_sizing.cancel_pending()
+        self.stop_live()
+        if self._reflow_source:
+            GLib.source_remove(self._reflow_source)
+            self._reflow_source = 0
 
-    def _tick(self):
-        if not self._paused:
-            self.refresh()
-        return True
+    def _live_allowed(self):
+        return (not self._destroyed and self.live.get_active()
+                and self.get_mapped())
 
-    def _toggle_pause(self, *_):
-        self._paused = not self._paused
-        # Invalidate an already-running periodic sample so Pause freezes the
-        # screen immediately when its callback eventually returns.
-        self._refresh_serial += 1
-        if self._paused:
-            # Start paused/manual samples from a clean rate baseline rather than
-            # averaging traffic across the entire paused interval.
-            self._previous_io = None
-            self.pause_btn.set_label("Resume")
-            self.pause_btn.set_image(Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON))
-            self.pause_btn.get_style_context().add_class("paused-live")
-            self.live_pill.set_state("Paused", "warning")
-            self.live_pill.set_tooltip_text("Live refresh is paused. Refresh Now still takes a one-shot sample.")
-        else:
-            self.pause_btn.set_label("Pause")
-            self.pause_btn.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
-            self.pause_btn.get_style_context().remove_class("paused-live")
-            self.live_pill.set_state("Live • 2s", "ok")
-            self.live_pill.set_tooltip_text("Network data refreshes every 2 seconds.")
-            # Avoid displaying a long pause interval as if it were an
-            # instantaneous transfer rate. The following sample establishes a
-            # fresh baseline and the next 2-second sample shows the live rate.
-            self._previous_io = None
-            self.refresh(force=True)
+    def _on_live(self, button):
+        self.stop_live()
+        active = button.get_active()
+        button.set_label('Live' if active else 'Paused')
+        button.set_image(Gtk.Image.new_from_icon_name('media-playback-start-symbolic' if active else 'media-playback-pause-symbolic', Gtk.IconSize.BUTTON))
+        ctx = button.get_style_context()
+        (ctx.add_class if active else ctx.remove_class)('active-live')
+        (ctx.remove_class if active else ctx.add_class)('paused-live')
+        if self._live_allowed():
+            self.refresh(automatic=True)
+        self._update_status()
 
-    def refresh(self, force=False):
-        if self._paused and not force:
+    def toggle_pause(self):
+        self.live.set_active(not self.live.get_active())
+
+    def _process_changed(self, *_):
+        self._layout_key = None
+        if hasattr(self, 'store'):
+            self._process_columns()
+            self._filter()
+            self._layout_key = None
+            self._resize(self.socket_scroll, self.socket_scroll.get_allocation())
+
+    def _process_columns(self):
+        visible = bool(self._snapshot and self._snapshot['processes'] and self.process_details.get_active_id() != 'off')
+        changed = self.columns[7].get_visible() != visible
+        if changed:
+            self.columns[6].set_visible(visible)
+            self.columns[7].set_visible(visible)
+            self._resize(self.socket_scroll, self.socket_scroll.get_allocation())
+
+    def _schedule_live(self, immediate=False):
+        self._cancel_live_timer()
+        if self._busy or not self._live_allowed():
             return
-        if self._busy:
+        if immediate:
+            self.refresh(automatic=True)
             return
-        self._busy = True
-        self._refresh_serial += 1
-        serial = self._refresh_serial
-        manual_while_paused = bool(force and self._paused)
-        self.app.run_async(
-            network_overview,
-            lambda snapshot, error, serial=serial, manual=manual_while_paused:
-                self._apply_snapshot(snapshot, error, serial, manual),
-        )
+        # Completion-based scheduling prevents overlapping reads. Back off on failure.
+        seconds = min(30, self.LIVE_SECONDS * (2 ** min(self._failures, 4)))
+        self._live_source = GLib.timeout_add_seconds(seconds, self._live_tick)
 
-    def _apply_snapshot(self, snapshot, error, serial=None, manual_while_paused=False):
-        self._busy = False
-        if serial is not None and serial != self._refresh_serial:
-            return False
-        if self._paused and not manual_while_paused:
-            return False
-        if error:
-            self.live_pill.set_state("Paused" if self._paused else "Live • 2s", "error")
-            self.live_pill.set_tooltip_text(f"Network refresh failed: {error}")
-            self.app.window.toast(f"Network refresh failed: {error}", "error")
-            return False
-
-        previous = self._previous_io
-        now = snapshot.get("timestamp", 0.0)
-        recv_total = snapshot.get("bytes_recv", 0)
-        sent_total = snapshot.get("bytes_sent", 0)
-        if previous:
-            dt = max(0.05, now - previous[0])
-            self._rx_rate = max(0.0, (recv_total - previous[1]) / dt)
-            self._tx_rate = max(0.0, (sent_total - previous[2]) / dt)
-        else:
-            self._rx_rate = self._tx_rate = 0.0
-        self._previous_io = (now, recv_total, sent_total)
-        self._snapshot = snapshot
-
-        connected = snapshot.get("connected", False)
-        dns_ok = snapshot.get("dns_ok", False)
-        net_state = "info" if connected is None else "ok" if connected and dns_ok else "warning"
-        interface = snapshot.get("primary_interface", "—")
-        ip = snapshot.get("primary_ipv4", "—")
-        gateway = snapshot.get("gateway", "—")
-        dns_servers = snapshot.get("dns_servers", [])
-        self.cards["interface"].update(
-            interface,
-            "Couldn't check route" if connected is None else ("Route available • DNS OK" if dns_ok else "Route available • DNS issue") if connected else "No default route",
-            snapshot.get("route_error") or f"{ip} • GW {gateway}",
-            net_state,
-        )
-        self.cards["interface"].set_tooltip_text(
-            "DNS: " + (", ".join(dns_servers) if dns_servers else "not detected")
-        )
-        self.cards["download"].update(
-            human_rate(self._rx_rate), "Receiving", f"Total {human_bytes(recv_total)}",
-            "ok" if connected else "warning",
-        )
-        self.cards["upload"].update(
-            human_rate(self._tx_rate), "Transmitting", f"Total {human_bytes(sent_total)}",
-            "ok" if connected else "warning",
-        )
-        self.cards["connections"].update(
-            str(snapshot.get("established", 0)), "Established",
-            f"{snapshot.get('tcp_count', 0)} TCP • {snapshot.get('udp_count', 0)} UDP", "ok",
-        )
-        self.cards["listening"].update(
-            str(snapshot.get("listening", 0)), "Open endpoints", "Local listeners", "info",
-        )
-
-        self.rx_legend.set_text(f"● RX {human_rate(self._rx_rate)}")
-        self.tx_legend.set_text(f"● TX {human_rate(self._tx_rate)}")
-        self.traffic_graph.add_values(self._rx_rate, self._tx_rate)
-        if self._paused:
-            self.live_pill.set_state("Paused", "warning")
-            self.live_pill.set_tooltip_text("Paused after a manual one-shot refresh.")
-        else:
-            self.live_pill.set_state("Live • 2s", "ok" if connected else "warning")
-            self.live_pill.set_tooltip_text("Network data refreshes every 2 seconds.")
-        self.updated_label.set_text("Last updated " + datetime.now().strftime("%H:%M:%S"))
-        self._render_tables()
-        if self.view_stack.get_visible_child_name() == "interfaces":
-            self._render_interfaces()
+    def _live_tick(self):
+        self._live_source = 0
+        if self._live_allowed():
+            self.refresh(automatic=True)
         return False
 
-    def _filtered_connections(self, listeners=False):
-        if not self._snapshot:
-            return []
-        text = self.search.get_text().strip().lower()
-        protocol = self.protocol.get_active_text() or "All Protocols"
-        scope = self.scope.get_active_text() or "All Scopes"
-        state = self.state.get_active_text() or "All States"
-        rows = []
-        for row in self._snapshot.get("connections", []):
-            if bool(row.get("listening")) != bool(listeners):
-                continue
-            if protocol != "All Protocols" and row.get("protocol") != protocol:
-                continue
-            if not listeners and scope != "All Scopes" and row.get("scope") != scope:
-                continue
-            if not listeners and state != "All States" and row.get("state") != state:
-                continue
-            if text:
-                haystack = " ".join((
-                    row.get("process", ""), row.get("user", ""), row.get("exe", ""),
-                    row.get("interface", ""), row.get("scope", ""),
-                    row.get("protocol", ""), row.get("family", ""),
-                    row.get("local", ""), row.get("remote", ""), row.get("state", ""),
-                    str(row.get("pid", "")),
-                )).lower()
-                if text not in haystack:
-                    continue
-            rows.append(row)
-        return rows
+    def _compare_rows(self, model, left, right, column):
+        # Fetch only the fields needed to decide the order. Most endpoint sorts
+        # finish after one pair of GTK reads, without copying nine-column rows.
+        for index in self.SORT_FIELDS[column]:
+            left_raw = model.get_value(left, 8) if index == 7 else ''
+            right_raw = model.get_value(right, 8) if index == 7 else ''
+            result = compare(network_field_key(model.get_value(left, index), index, left_raw),
+                             network_field_key(model.get_value(right, index), index, right_raw))
+            if result:
+                return result
+        return 0
 
-    def _append_row(self, store, row):
-        store.append([
-            row.get("key", ""),
-            row.get("protocol", "—"),
-            row.get("process", "—"),
-            row.get("local", "—"),
-            row.get("remote", "—"),
-            row.get("state", "NONE"),
-            int(row.get("pid") or 0),
-            row.get("family", "—"),
-            bool(row.get("listening")),
-            row.get("scope", "Unknown"),
-            row.get("interface", "—"),
-            row.get("user", "—"),
-            row.get("exe", "—"),
-            row.get("local_ip", "*"),
-            int(row.get("local_port") or 0),
-            row.get("remote_ip", "*"),
-            int(row.get("remote_port") or 0),
-        ])
+    def _state_cell(self, _col, cell, model, itr, index):
+        state = model.get_value(itr, 1)
+        if index in (3, 5):
+            color = AMBER
+        elif index == 6:
+            color = BLUE if model.get_value(itr, index) != '—' else GRAY
+        elif index == 7:
+            color = PURPLE if model.get_value(itr, index) != '—' else GRAY
+        else:
+            color = STATE_COLORS.get(state, GRAY) if index in (0, 1) else STATE_TEXT_COLORS.get(state, GRAY)
+        cell.set_property('foreground', color)
+        cell.set_property('weight', Pango.Weight.SEMIBOLD if index in (1, 6) else Pango.Weight.NORMAL)
 
-    def _scroll_value(self, scroll):
-        try:
-            return float(scroll.get_vadjustment().get_value())
-        except Exception:
-            return 0.0
-
-    def _restore_scroll(self, scroll, value):
-        try:
-            adj = scroll.get_vadjustment()
-            maximum = max(adj.get_lower(), adj.get_upper() - adj.get_page_size())
-            adj.set_value(min(max(value, adj.get_lower()), maximum))
-        except Exception:
-            pass
-        return False
-
-    def _restore_selected_key(self, tree, key):
-        if not key:
-            return False
-        model = tree.get_model()
-        # Integer paths avoid iter_next() binding differences across GTK3 /
-        # PyGObject versions and also work while ListStore sorting is active.
-        for index in range(len(model)):
-            try:
-                itr = model.get_iter(Gtk.TreePath.new_from_indices([index]))
-            except Exception:
-                continue
-            if model.get_value(itr, self.COL_KEY) == key:
-                tree.get_selection().select_iter(itr)
+    def _query_tooltip(self, tree, x, y, keyboard, tooltip):
+        if keyboard:
+            model, itr = tree.get_selection().get_selected()
+            if itr is None:
                 return False
-        return False
-
-    def _render_tables(self):
-        if not hasattr(self, "connection_store"):
-            return
-        selected_key = self._selected_key
-        conn_scroll = self._scroll_value(self.connection_scroll)
-        listener_scroll = self._scroll_value(self.listener_scroll)
-        connections = self._filtered_connections(listeners=False)
-        listeners = self._filtered_connections(listeners=True)
-
-        self.connection_store.clear()
-        for row in connections:
-            self._append_row(self.connection_store, row)
-        self.listener_store.clear()
-        for row in listeners:
-            self._append_row(self.listener_store, row)
-
-        GLib.idle_add(self._restore_selected_key, self.connection_tree, selected_key)
-        GLib.idle_add(self._restore_scroll, self.connection_scroll, conn_scroll)
-        GLib.idle_add(self._restore_scroll, self.listener_scroll, listener_scroll)
-
-        visible = self.view_stack.get_visible_child_name() if hasattr(self, "view_stack") else "connections"
-        all_rows = self._snapshot.get("connections", []) if self._snapshot else []
-        total_connections = sum(1 for row in all_rows if not row.get("listening"))
-        total_listeners = sum(1 for row in all_rows if row.get("listening"))
-        if visible == "listeners":
-            if len(listeners) != total_listeners:
-                self.count_label.set_text(f"{len(listeners)} shown • {total_listeners} total")
-            else:
-                self.count_label.set_text(f"{len(listeners)} listening")
-        elif visible == "interfaces":
-            count = len(self._snapshot.get("interfaces", [])) if self._snapshot else 0
-            self.count_label.set_text(f"{count} interfaces")
         else:
-            if len(connections) != total_connections:
-                self.count_label.set_text(f"{len(connections)} shown • {total_connections} total")
-            else:
-                self.count_label.set_text(f"{len(connections)} connections")
-
-    def _render_interfaces(self):
-        if not self._snapshot:
-            return
-        for child in self.interfaces_box.get_children():
-            self.interfaces_box.remove(child)
-        primary = self._snapshot.get("primary_interface")
-        for item in self._snapshot.get("interfaces", []):
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-            row.get_style_context().add_class("network-interface-row")
-            row.set_border_width(12)
-
-            icon = Gtk.Image.new_from_icon_name(
-                "network-wired-symbolic" if item.get("up") else "network-offline-symbolic",
-                Gtk.IconSize.LARGE_TOOLBAR,
-            )
-            icon.get_style_context().add_class("ok" if item.get("up") else "muted")
-            row.pack_start(icon, False, False, 4)
-
-            name_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-            name = item.get("name", "—")
-            name_label = Gtk.Label(label=name + ("  •  Primary" if name == primary else ""), xalign=0)
-            name_label.get_style_context().add_class("action-title")
-            status = "Up" if item.get("up") else "Down"
-            speed = item.get("speed_mbps", 0)
-            meta = f"{status} • MTU {item.get('mtu', 0)}"
-            if speed:
-                meta += f" • {speed} Mb/s"
-            meta_label = Gtk.Label(label=meta, xalign=0)
-            meta_label.get_style_context().add_class("muted")
-            name_box.pack_start(name_label, False, False, 0)
-            name_box.pack_start(meta_label, False, False, 0)
-            row.pack_start(name_box, False, False, 0)
-
-            address_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-            ipv4 = ", ".join(item.get("ipv4", [])) or "No IPv4 address"
-            ipv6 = ", ".join(item.get("ipv6", [])[:2]) or "No IPv6 address"
-            a4 = Gtk.Label(label=f"IPv4  {ipv4}", xalign=0)
-            a6 = Gtk.Label(label=f"IPv6  {ipv6}", xalign=0)
-            a4.set_ellipsize(Pango.EllipsizeMode.END)
-            a6.set_ellipsize(Pango.EllipsizeMode.END)
-            a6.get_style_context().add_class("muted")
-            address_box.pack_start(a4, False, False, 0)
-            address_box.pack_start(a6, False, False, 0)
-            row.pack_start(address_box, True, True, 0)
-
-            traffic = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-            rx = Gtk.Label(label=f"↓ {human_bytes(item.get('bytes_recv', 0))}", xalign=1)
-            tx = Gtk.Label(label=f"↑ {human_bytes(item.get('bytes_sent', 0))}", xalign=1)
-            rx.get_style_context().add_class("network-rx")
-            tx.get_style_context().add_class("network-tx")
-            traffic.pack_start(rx, False, False, 0)
-            traffic.pack_start(tx, False, False, 0)
-            row.pack_end(traffic, False, False, 0)
-            self.interfaces_box.pack_start(row, False, False, 0)
-
-        if not self._snapshot.get("interfaces"):
-            empty = Gtk.Label(label="No interface information is available.", xalign=0)
-            empty.get_style_context().add_class("empty-text")
-            self.interfaces_box.pack_start(empty, False, False, 12)
-        self.interfaces_box.show_all()
-
-    def _row_dict_from_model(self, model, itr):
-        return {
-            "key": model.get_value(itr, self.COL_KEY),
-            "protocol": model.get_value(itr, self.COL_PROTOCOL),
-            "process": model.get_value(itr, self.COL_PROCESS),
-            "local": model.get_value(itr, self.COL_LOCAL),
-            "remote": model.get_value(itr, self.COL_REMOTE),
-            "state": model.get_value(itr, self.COL_STATE),
-            "pid": model.get_value(itr, self.COL_PID),
-            "family": model.get_value(itr, self.COL_FAMILY),
-            "scope": model.get_value(itr, self.COL_SCOPE),
-            "interface": model.get_value(itr, self.COL_INTERFACE),
-            "user": model.get_value(itr, self.COL_USER),
-            "exe": model.get_value(itr, self.COL_EXE),
-            "local_ip": model.get_value(itr, self.COL_LOCAL_IP),
-            "local_port": model.get_value(itr, self.COL_LOCAL_PORT),
-            "remote_ip": model.get_value(itr, self.COL_REMOTE_IP),
-            "remote_port": model.get_value(itr, self.COL_REMOTE_PORT),
-        }
-
-    def _selection_changed(self, tree):
-        selection = tree.get_selection()
-        model, itr = selection.get_selected()
-        if itr is None:
-            return
-        row = self._row_dict_from_model(model, itr)
-        if tree is self.connection_tree:
-            self._selected_key = row["key"]
-            self._detail_row = row
-            self._set_details(row)
-
-    def _set_details(self, row):
-        pid = row.get("pid") or 0
-        lines = [
-            f"Process:      {row.get('process') or '—'}",
-            f"PID:          {pid if pid else 'Unavailable'}",
-            f"User:         {row.get('user') or '—'}",
-            f"Executable:   {row.get('exe') or '—'}",
-            "",
-            f"Interface:    {row.get('interface') or '—'}",
-            f"Protocol:     {row.get('protocol', '—')} / {row.get('family', '—')}",
-            f"Scope:        {row.get('scope', 'Unknown')}",
-            f"State:        {row.get('state', '—')}",
-            "",
-            f"Local:        {row.get('local', '—')}",
-            f"Remote:       {row.get('remote', '—')}",
-        ]
-        self.detail.get_buffer().set_text("\n".join(lines))
-        self.filter_process_btn.set_sensitive(row.get("process") not in (None, "", "—"))
-        self.filter_remote_btn.set_sensitive(row.get("remote_ip") not in (None, "", "*", "—"))
-
-    def _clipboard(self, text, message="Copied"):
-        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(str(text or ""), -1)
-        self.app.window.toast(message, "ok")
-
-    def _copy_details(self, *_):
-        buf = self.detail.get_buffer()
-        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
-        self._clipboard(text, "Connection details copied")
-
-    def _filter_detail_process(self):
-        row = self._detail_row or {}
-        value = row.get("process")
-        if value and value != "—":
-            self.search.set_text(value)
-
-    def _filter_detail_remote(self):
-        row = self._detail_row or {}
-        value = row.get("remote_ip")
-        if value and value not in ("—", "*"):
-            self.search.set_text(value)
-
-    def _set_combo_text(self, combo, text):
-        model = combo.get_model()
-        if model is None:
-            return False
-        for index in range(len(model)):
-            try:
-                itr = model.get_iter(Gtk.TreePath.new_from_indices([index]))
-            except Exception:
-                continue
-            if model.get_value(itr, 0) == text:
-                combo.set_active(index)
-                return True
-        return False
-
-    def _clear_filters(self, *_):
-        self.search.set_text("")
-        self.protocol.set_active(0)
-        self.scope.set_active(0)
-        self.state.set_active(0)
-        self._render_tables()
-
-    def _context_row(self, tree, event):
-        hit = tree.get_path_at_pos(int(event.x), int(event.y))
-        if not hit:
-            return None
-        path = hit[0]
-        tree.get_selection().select_path(path)
-        model = tree.get_model()
-        itr = model.get_iter(path)
-        return self._row_dict_from_model(model, itr)
-
-    def _tree_button_press(self, tree, event, listening=False):
-        if event.button != 3:
-            return False
-        row = self._context_row(tree, event)
-        if not row:
-            return False
-        menu = Gtk.Menu()
-
-        def item(label, callback, sensitive=True):
-            entry = Gtk.MenuItem(label=label)
-            entry.set_sensitive(bool(sensitive))
-            entry.connect("activate", callback)
-            menu.append(entry)
-            return entry
-
-        if listening:
-            item("Copy Listener", lambda *_: self._clipboard(
-                f"{row.get('protocol')} {row.get('local')} {row.get('process')} PID {row.get('pid') or '—'}",
-                "Listener copied",
-            ))
-            item("Copy Local IP", lambda *_: self._clipboard(row.get("local_ip"), "Local IP copied"), row.get("local_ip") not in ("*", "—"))
-            item("Copy Port", lambda *_: self._clipboard(row.get("local_port"), "Port copied"), bool(row.get("local_port")))
-        else:
-            item("Copy Connection", lambda *_: self._clipboard(
-                f"{row.get('protocol')} {row.get('local')} → {row.get('remote')} {row.get('state')}",
-                "Connection copied",
-            ))
-            item("Copy Remote IP", lambda *_: self._clipboard(row.get("remote_ip"), "Remote IP copied"), row.get("remote_ip") not in ("*", "—"))
-            item("Copy Remote Port", lambda *_: self._clipboard(row.get("remote_port"), "Remote port copied"), bool(row.get("remote_port")))
-
-        menu.append(Gtk.SeparatorMenuItem())
-        process = row.get("process")
-        item("Filter This Process", lambda *_: self.search.set_text(process), process not in (None, "", "—"))
-        if not listening:
-            remote_ip = row.get("remote_ip")
-            item("Filter This Remote", lambda *_: self.search.set_text(remote_ip), remote_ip not in (None, "", "*", "—"))
-            scope = row.get("scope") or "Unknown"
-            item(f"Show Only {scope}", lambda *_: self._set_combo_text(self.scope, scope), scope in ("Local", "LAN", "Internet", "Unknown"))
-        menu.append(Gtk.SeparatorMenuItem())
-        item("Clear Filters", self._clear_filters)
-        menu.show_all()
-        try:
-            menu.popup_at_pointer(event)
-        except Exception:
-            menu.popup(None, None, None, None, event.button, event.time)
+            hit = tree.get_path_at_pos(int(x), int(y))
+            if not hit:
+                return False
+            model = tree.get_model()
+            itr = model.get_iter(hit[0])
+        values = tuple(model[itr])
+        text = '\n'.join(f'{self.HEADERS[index]}: {values[index]}' for index in self.DISPLAY_ORDER)
+        if values[8]:
+            text += '\nSocket details: ' + values[8]
+        tooltip.set_text(text)
         return True
+
+    @staticmethod
+    def _interface_color(item):
+        state = item.get('operstate', 'UNKNOWN')
+        if state == 'UP':
+            return BLUE
+        if 'UP' not in item.get('flags', []):
+            return GRAY
+        return RED if state == 'DOWN' else AMBER if state == 'DORMANT' else GRAY
+
+    @staticmethod
+    def _colored_line(text, color):
+        return f'<span foreground="{color}">{GLib.markup_escape_text(text)}</span>'
+
+    def _refresh_clicked(self, *_):
+        self.refresh()
+
+    def refresh(self, automatic=False):
+        if self._busy or self._destroyed:
+            return
+        self._cancel_live_timer()
+        self._busy = True
+        self._loaded_once = True
+        if not automatic:
+            self.refresh_btn.set_sensitive(False)
+        if self._snapshot is None:
+            self._update_status()
+        # Read GTK values here; the worker never touches GTK widgets.
+        processes = self.process_details.get_active_id() != 'off'
+        generation = self._generation
+        self.app.run_async(lambda: snapshot(processes, host=self.host) if self.host else snapshot(processes),
+                           lambda result, error: self._loaded(result, error, generation, automatic))
+
+    def _loaded(self, result, error, generation=None, automatic=False):
+        if self._destroyed:
+            return False
+        self._busy = False
+        if not self.refresh_btn.get_sensitive():
+            self.refresh_btn.set_sensitive(True)
+        if generation is not None and generation != self._generation:
+            # A pause/hide invalidates the read. Resume waits for it to finish,
+            # then starts a fresh read without overlapping the old worker.
+            if not automatic and self.get_mapped() and self._snapshot is None and not self.live.get_active():
+                self.refresh()
+            else:
+                self._schedule_live(immediate=True)
+            return False
+        if automatic and not self._live_allowed():
+            return False
+        self._last_error = str(error) if error else None
+        if error:
+            self._failures += 1
+            self._update_status()
+            self._schedule_live()
+            return False
+        self._failures = self._failures + 1 if result['errors'] else 0
+        self._snapshot = result
+        preferred = getattr(self.host, 'profile', {}).get('hostname') if self.host else None
+        address = host_lan_ip(result['interfaces'], result['routes'], preferred)
+        ip_text = 'IP: ' + (address or 'unavailable')
+        if self.host_ip_label.get_text() != ip_text:
+            color = BLUE if address else AMBER
+            value = GLib.markup_escape_text(address or 'unavailable')
+            self.host_ip_label.set_markup(f'IP: <span foreground="{color}" weight="bold">{value}</span>')
+            self.host_ip_label.set_tooltip_text(ip_text + ' · host interface address from the latest snapshot')
+        self._rows = result['sockets'] or []
+        lines = []
+        count = len(result['interfaces']) if result['interfaces'] is not None else 'unavailable'
+        title = f'Interfaces & routes ({count})'
+        if self.overview_expander.get_label() != title:
+            self.overview_expander.set_label(title)
+        if result['interfaces'] is None:
+            lines.append(self._colored_line("Interfaces: couldn't check", RED))
+        else:
+            for item in result['interfaces']:
+                addresses = ', '.join(f"{addr.get('local', '?')}/{addr.get('prefixlen', '?')}"
+                                      for addr in item.get('addr_info', [])) or 'no address'
+                flags = item.get('flags', [])
+                state = item.get('operstate', 'UNKNOWN')
+                # UNKNOWN is common on tunnels/loopback; don't call it disconnected.
+                admin = 'up' if 'UP' in flags else 'down'
+                lines.append(self._colored_line(
+                    f"{item.get('ifname', '?')}  {state} (admin {admin})  {addresses}", self._interface_color(item)))
+        for route in result['routes']:
+            lines.append(self._colored_line(f"default via {route.get('gateway', 'direct')} dev {route.get('dev', '?')}", BLUE))
+        markup = '\n'.join(lines) or 'No interfaces reported'
+        if markup != self.overview.get_label():
+            self.overview.set_markup(markup)
+        self._process_columns()
+        self._filter()
+        self._schedule_live()
+        return False
+
+    def _filter(self):
+        if self._destroyed:
+            return
+        needle = self.search.get_text().strip().lower()
+        kind = self.kind.get_active()
+        hide_time_wait = self.hide_time_wait.get_active()
+        extended = self.process_details.get_active_id() == 'extended'
+        values_to_show = []
+        for row in self._rows:
+            if hide_time_wait and row['state'] == 'TIME-WAIT':
+                continue
+            idle = row['state'] in ('LISTEN', 'UNCONN')
+            if (kind == 1 and idle) or (kind == 2 and not idle):
+                continue
+            values = network_display_row(row, extended=extended)
+            if needle and needle not in ' '.join(values).lower():
+                continue
+            values_to_show.append(values)
+        # Socket enumeration order can change without any actual data change.
+        # Avoid rebuilding and repainting an unchanged sorted table.
+        signature = tuple(sorted(values_to_show))
+        if signature != self._display_signature:
+            self._column_chars = [max([max(map(len, header.split()))] +
+                                      [len(values[index]) for values in values_to_show])
+                                  for index, header in enumerate(self.HEADERS)]
+            if not self._has_fitted_snapshot:
+                self._has_fitted_snapshot = True
+                self._layout_key = None
+            self._resize(self.socket_scroll, self.socket_scroll.get_allocation())
+            selected = self._selected_key()
+            adjustment = self.socket_scroll.get_vadjustment()
+            scroll = adjustment.get_value()
+            # Keep stable GTK rows; a small socket change should not replace
+            # and re-sort the whole table. Counts preserve duplicate sockets.
+            needed = Counter(values_to_show)
+            obsolete = []
+            for row in self.store:
+                values = tuple(row)
+                if needed[values]:
+                    needed[values] -= 1
+                else:
+                    obsolete.append(row.iter)
+            # Add replacements before removing expired rows: the view never
+            # collapses to zero height between two non-empty snapshots.
+            for values in values_to_show:
+                if needed[values]:
+                    itr = self.store.append(values)
+                    needed[values] -= 1
+                    if selected and self._row_identity(values) == self._row_identity(selected):
+                        self.tree.get_selection().select_iter(itr)
+            for itr in obsolete:
+                self.store.remove(itr)
+            adjustment.set_value(scroll)
+            self._display_signature = signature
+        self._update_status()
+
+    def _update_status(self):
+        if self._destroyed:
+            return
+        if self.live.get_active():
+            mode = 'LIVE' if self.get_mapped() else 'LIVE · hidden'
+        else:
+            mode = 'paused'
+        if self._last_error:
+            self.status.set_text(f"{mode} · Couldn't refresh: {self._last_error}. Previous snapshot retained.")
+            return
+        if not self._snapshot:
+            self.status.set_text(f"{mode} · no snapshot loaded" if not self._busy else f"{mode} · reading snapshot…")
+            return
+        snap = self._snapshot
+        text = f"{mode} · {len(self.store)} shown / {len(self._rows)} loaded  ·  snapshot {snap['time']}"
+        if self._failures and self.live.get_active():
+            text += ' · refresh slowed after collection errors'
+        if snap['limited']:
+            text += '  ·  snapshot limited'
+        if snap['processes']:
+            text += '  ·  process visibility depends on permissions'
+        if snap['errors']:
+            text += '  ·  ' + ' | '.join(snap['errors'])
+        self.status.set_text(text)
+
+    @staticmethod
+    def _row_identity(values):
+        return tuple(values[:6]) + (values[8],)
+
+    def _selected_key(self):
+        model, itr = self.tree.get_selection().get_selected()
+        return tuple(model[itr]) if itr is not None else None
+
+    def _selected(self, *_):
+        self.copy.set_sensitive(self._selected_key() is not None)
+
+    def _copy(self, *_):
+        values = self._selected_key()
+        if values:
+            text = '\t'.join(values[index] for index in self.DISPLAY_ORDER
+                             if self.columns[index].get_visible())
+            if values[8] and values[8] != values[7]:
+                text += '\nSocket details: ' + values[8]
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+            self.app.window.toast('Socket copied')
+
+    def _resize(self, _scroll, allocation):
+        # Wait for a real viewport; unallocated GTK widgets start at one pixel.
+        if allocation.width <= 1:
+            return
+        key = (allocation.width, self.columns[7].get_visible())
+        if key == self._layout_key:
+            return
+        self._layout_key = key
+        # Keep widths stable between snapshots; fit again only for a changed
+        # viewport, process mode, first data, or an explicit Fit columns action.
+        # Equal rules for both endpoints: content-fit fields, bounded widths,
+        # and a trailing blank area instead of stretching the last port.
+        usable = max(500, allocation.width - 12)
+        process = self.columns[7].get_visible()
+        metrics = self.tree.get_pango_context().get_metrics(None, None)
+        char_width = max(metrics.get_approximate_char_width(),
+                         metrics.get_approximate_digit_width()) / Pango.SCALE
+        desired = [int(count * char_width) + 24 for count in self._column_chars]
+        proto = min(64, max(52, desired[0]))
+        state = min(96 if usable >= 850 else 76, max(68, desired[1]))
+        port = min(72, max(64, desired[3], desired[5]))
+        pid = min(100 if usable >= 850 else 60, max(60, desired[6])) if process else 0
+        widths = [proto, state, 0, port, 0, port, pid, 0]
+        flexible = [2, 4, 7] if process else [2, 4]
+        minima = {2: 80, 4: 80, 7: 88}
+        caps = {2: 360, 4: 360, 7: 240}
+        targets = {index: min(caps[index], max(minima[index], desired[index])) for index in flexible}
+        budget = usable - sum(widths) - 16
+        if sum(targets.values()) <= budget:
+            for index in flexible:
+                widths[index] = targets[index]
+        else:
+            extra = max(0, budget - sum(minima[index] for index in flexible))
+            weights = {index: targets[index] - minima[index] for index in flexible}
+            total_weight = sum(weights.values()) or 1
+            for index in flexible:
+                widths[index] = minima[index] + extra * weights[index] // total_weight
+        self.column_sizing.apply_deferred(widths)
+
+    def _fit_columns(self, *_):
+        self._layout_key = None
+        self.column_sizing.reset()
+        self._resize(self.socket_scroll, self.socket_scroll.get_allocation())
+
+    def _schedule_reflow(self):
+        if self._destroyed:
+            return
+        if self._reflow_source:
+            GLib.source_remove(self._reflow_source)
+        self._reflow_source = GLib.timeout_add(100, self._reflow)
+
+    def _reflow(self):
+        self._reflow_source = 0
+        if self._destroyed:
+            return False
+        for row in self.store:
+            self.store.row_changed(row.path, row.iter)
+        return False

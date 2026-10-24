@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=SysLogApp
-Comment=System health, logs, and network diagnostics
+Comment=Terminal-style journal and network viewer
 Exec=/usr/bin/syslogapp
-Icon=utilities-system-monitor
+Icon=syslogapp
 Terminal=false
 Categories=System;Monitor;
 StartupNotify=true
-StartupWMClass=SysLogApp
+StartupWMClass=Syslogapp.py

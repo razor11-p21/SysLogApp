@@ -10,9 +10,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-REQUIRED_COMMANDS = ('journalctl', 'systemctl', 'ip', 'getent', 'ping')
-OPTIONAL_COMMANDS = ('pkexec', 'apt-get', 'dpkg')
-DEPENDENCY_HINT = 'python3 python3-gi python3-gi-cairo python3-cairo gir1.2-gtk-3.0 python3-psutil systemd iproute2 iputils-ping libc-bin pkexec polkitd'
+REQUIRED_COMMANDS = ('journalctl', 'ip', 'ss', 'ssh')
+DEPENDENCY_HINT = 'python3 python3-gi gir1.2-gtk-3.0 systemd iproute2 openssh-client'
 
 
 def check_dependencies():
@@ -22,21 +21,12 @@ def check_dependencies():
     try:
         import gi
         gi.require_version('Gtk', '3.0')
-        from gi.repository import Gtk  # noqa: F401 -- verify GTK3 typelib
-        gi.require_foreign('cairo')
-        import cairo  # noqa: F401
+        from gi.repository import Gtk  # noqa: F401
     except (ImportError, ValueError) as exc:
-        missing.append(f'GTK3/PyGObject/Cairo ({exc})')
-    try:
-        import psutil  # noqa: F401
-    except ImportError:
-        missing.append('python3-psutil')
+        missing.append(f'GTK3/PyGObject ({exc})')
     missing.extend(command for command in REQUIRED_COMMANDS if not shutil.which(command))
     if missing:
         raise RuntimeError('Missing dependencies: ' + ', '.join(missing) + '\nInstall on Mint/Ubuntu: sudo apt install ' + DEPENDENCY_HINT)
-    optional = [command for command in OPTIONAL_COMMANDS if not shutil.which(command)]
-    if optional:
-        print('Optional maintenance tools unavailable (their actions will be disabled): ' + ', '.join(optional))
 
 
 def replace_file(target, data, mode):
@@ -108,7 +98,8 @@ def install(source, user_directory=None, preflight=True):
         if old_files[desktop] is None:
             # Desktop Exec uses its own quoting rules, not shell quoting.
             escaped = str(launcher).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
-            entry = f'[Desktop Entry]\nType=Application\nName=SysLogApp\nComment=System insights and troubleshooting for Linux\nExec="{escaped}"\nIcon=utilities-system-monitor\nTerminal=false\nCategories=System;Utility;\nStartupNotify=true\nStartupWMClass=SysLogApp\n'
+            icon = str(app / 'syslogapp/assets/syslogapp.svg') if (app / 'syslogapp/assets/syslogapp.svg').exists() else 'utilities-terminal'
+            entry = f'[Desktop Entry]\nType=Application\nName=SysLogApp\nComment=Terminal-style journal and network viewer\nExec="{escaped}"\nIcon={icon}\nTerminal=false\nCategories=System;Utility;\nStartupNotify=true\nStartupWMClass=Syslogapp.py\n'
             replaced_files.append(desktop)
             replace_file(desktop, entry.encode(), 0o644)
         if moved_previous:

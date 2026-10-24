@@ -4,13 +4,24 @@ import csv
 import json
 import subprocess
 import threading
+from collections import deque
 from datetime import datetime
+from functools import lru_cache
 
 from gi.repository import Gtk, GLib, Gdk, Pango
 
-from ..widgets import WrappingToolbar
+from ..widgets import CommandBar, action_menu, ColumnSizing, TableTextAccess, selectable_readouts
+from ..config import column_widths
+from ..config import log_capacity
+from ..sorting import log_sort_key, compare, natural_key, timestamp_key
 
 from ..services import load_logs, PRIORITY_LABELS
+
+
+SEVERITY_COLORS = {0: '#ff4d57', 1: '#ff5962', 2: '#ff6b73', 3: '#ff8188',
+                   4: '#ffb34c', 5: '#b69cff', 6: '#6aa8ff', 7: '#9aa8b7'}
+MESSAGE_COLORS = {0: '#ff7a82', 1: '#ff858c', 2: '#ff8f96', 3: '#ff9da3',
+                  4: '#f6bd67', 5: '#c2afff', 6: '#c6d4c9', 7: '#9aa8b7'}
 
 
 class LogsPage(Gtk.Box):
@@ -24,6 +35,7 @@ class LogsPage(Gtk.Box):
     def __init__(self, app):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.app = app
+        self.host = getattr(app, "host", None)
         self._live_proc = None
         self._live_thread = None
         self._busy = False
@@ -32,48 +44,33 @@ class LogsPage(Gtk.Box):
         self._all_rows = []
         self._last_pane_width = 0
         self._live_generation = 0
-        self._live_error_line = None
-        self._live_paused = False
-        self._paused_new_count = 0
         self._destroyed = False
-        self._row_reflow_source = 0
+        self.max_rows = log_capacity(app.config)
+        self._pending_lock = threading.Lock()
+        self._pending_rows = deque(maxlen=self.max_rows)
+        self._drain_source = 0
+        self._dropped_pending = 0
+        self._stream_dropped = 0
+        self._mapped_once = False
+        self._reflow_source = 0
         self.set_border_width(0)
 
-        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        top.set_border_width(22)
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        titlebox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        title = Gtk.Label(label="Logs", xalign=0)
-        title.get_style_context().add_class("page-title")
-        sub = Gtk.Label(label="Explore, filter, and follow the system journal.", xalign=0)
-        sub.set_line_wrap(True)
-        sub.set_max_width_chars(55)
-        sub.get_style_context().add_class("page-subtitle")
-        titlebox.pack_start(title, False, False, 0)
-        titlebox.pack_start(sub, False, False, 0)
-        header.pack_start(titlebox, True, True, 0)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        top.set_border_width(8)
         self.count_label = Gtk.Label(label="0 entries")
         self.count_label.get_style_context().add_class("muted")
-        header.pack_end(self.count_label, False, False, 0)
-        top.pack_start(header, False, False, 0)
 
-        toolbar = WrappingToolbar()
-        toolbar.get_style_context().add_class("toolbar-card")
-        toolbar.set_border_width(10)
+        self.command_bar = CommandBar()
+        toolbar = self.command_bar.primary
+        toolbar.set_border_width(2)
 
-        self.live = Gtk.ToggleButton(label="Live")
-        self.live.set_image(Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON))
+        self.live = Gtk.ToggleButton(label="Paused")
+        self.live.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
+        self.live.get_style_context().add_class("paused-live")
+        self.live.set_tooltip_text("Pause or resume live journal updates (F6 / F7)")
         self.live.set_always_show_image(True)
         self.live.connect("toggled", self._on_live)
         toolbar.add(self.live)
-
-        self.pause_live = Gtk.ToggleButton(label="Pause")
-        self.pause_live.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
-        self.pause_live.set_always_show_image(True)
-        self.pause_live.set_sensitive(False)
-        self.pause_live.set_tooltip_text("Pause automatic scrolling while Live continues collecting events")
-        self.pause_live.connect("toggled", self._on_pause_live)
-        toolbar.add(self.pause_live)
 
         self.scope = Gtk.ComboBoxText()
         self.scope.append("boot", "Current Boot")
@@ -91,49 +88,49 @@ class LogsPage(Gtk.Box):
 
         self.unit = Gtk.Entry()
         self.unit.set_placeholder_text("Service/unit (optional)")
-        self.unit.set_width_chars(17)
+        self.unit.set_width_chars(13)
         self.unit.connect("activate", self._unit_activate)
-        toolbar.add(self.unit)
 
         self.search = Gtk.SearchEntry()
         self.search.set_placeholder_text("Search loaded logs…")
         self.search.set_hexpand(True)
         self.search.connect("search-changed", self._search_changed)
-        toolbar.add(self.search)
+        self.search.set_width_chars(12)
+        self.command_bar.secondary.pack_start(self.search, True, True, 0)
+        self.command_bar.secondary.pack_start(self.unit, False, False, 0)
 
         refresh = Gtk.Button()
         refresh.add(Gtk.Image.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON))
         refresh.set_tooltip_text("Reload logs")
         refresh.connect("clicked", self._refresh_clicked)
-        toolbar.add(refresh)
+        self.command_bar.secondary.pack_start(refresh, False, False, 0)
 
-        export = Gtk.Button(label="Export")
-        export.set_image(Gtk.Image.new_from_icon_name("document-save-symbolic", Gtk.IconSize.BUTTON))
-        export.set_always_show_image(True)
-        export.connect("clicked", self._export)
-        toolbar.add(export)
-        top.pack_start(toolbar, False, False, 0)
+        self.more_actions = action_menu([('Export logs…', self._export), ('Fit columns', self._fit_columns)])
+        self.command_bar.secondary.pack_start(self.more_actions, False, False, 0)
+        toolbar.add(self.count_label)
+        top.pack_start(self.command_bar, False, False, 0)
 
         self.pack_start(top, False, False, 0)
 
-        self.pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.pane = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
         self.pane.set_wide_handle(True)
-        self.pane.set_margin_start(22)
-        self.pane.set_margin_end(22)
-        self.pane.set_margin_bottom(22)
+        self.pane.set_margin_start(10)
+        self.pane.set_margin_end(10)
+        self.pane.set_margin_bottom(8)
         self.pane.connect("size-allocate", self._resize_pane)
 
-        # Log list. The column widths are recalculated from the actual
-        # TreeView width so the message column grows and shrinks with the window.
+        # Native TreeView paints visible rows without a widget per event.
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         left.get_style_context().add_class("section-card")
         self.store = Gtk.ListStore(str, str, str, str, int, object)
+        for column in range(4):
+            self.store.set_sort_func(column, self._compare_rows, column)
+        self.store.set_sort_column_id(self.COL_TIME, Gtk.SortType.ASCENDING)
         self.tree = Gtk.TreeView(model=self.store)
         self.tree.set_headers_visible(True)
         self.tree.set_enable_search(False)
-        self.tree.set_grid_lines(Gtk.TreeViewGridLines.HORIZONTAL)
-        # Wrapped cells need variable row heights.  GTK3 defaults to this, but
-        # keep it explicit because fixed-height mode will clip wrapped messages.
+        self.tree.set_grid_lines(Gtk.TreeViewGridLines.NONE)
+        # Wrapped messages need variable heights; history remains bounded.
         self.tree.set_fixed_height_mode(False)
         # Do not use Gtk.TreeView.set_tooltip_column() here. GTK3 feeds that
         # value to Pango as markup, so legitimate journal text containing '&'
@@ -143,6 +140,7 @@ class LogsPage(Gtk.Box):
         self.tree.connect("query-tooltip", self._query_log_tooltip)
         self.tree.get_selection().connect("changed", self._selection_changed)
         self.tree.connect("button-press-event", self._tree_button_press)
+        self.tree.connect("row-activated", self._activate_event)
         # The log table uses the *viewport* width, not the TreeView's natural
         # request, as the source of truth for column sizing.  This is important
         # in GTK3: a TreeView containing long text may otherwise keep reporting
@@ -154,12 +152,13 @@ class LogsPage(Gtk.Box):
         # turning the entire table into a wall of color.
         self.severity_renderer = Gtk.CellRendererText()
         self.severity_renderer.set_property("xalign", 0.5)
-        self.severity_renderer.set_property("ypad", 6)
+        self.severity_renderer.set_property("yalign", 0.0)
+        self.severity_renderer.set_property("ypad", 0)
         severity_col = Gtk.TreeViewColumn("", self.severity_renderer)
         severity_col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
         severity_col.set_fixed_width(28)
         severity_col.set_min_width(28)
-        severity_col.set_max_width(28)
+        severity_col.set_max_width(-1)
         severity_col.set_cell_data_func(self.severity_renderer, self._severity_indicator_cell_data)
         self.tree.append_column(severity_col)
 
@@ -171,15 +170,15 @@ class LogsPage(Gtk.Box):
         ]
         for title_text, idx in specs:
             renderer = Gtk.CellRendererText()
-            renderer.set_property("ypad", 6)
+            renderer.set_property("ypad", 0)
+            renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
+            renderer.set_property("single-paragraph-mode", True)
+            renderer.set_property("yalign", 0.0)
             if idx == self.COL_MESSAGE:
-                # True responsive text: long messages wrap and the TreeView row
-                # grows vertically as its column becomes narrower.
                 renderer.set_property("ellipsize", Pango.EllipsizeMode.NONE)
+                renderer.set_property("single-paragraph-mode", False)
                 renderer.set_property("wrap-mode", Pango.WrapMode.WORD_CHAR)
                 renderer.set_property("wrap-width", 420)
-            else:
-                renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
 
             col = Gtk.TreeViewColumn(title_text, renderer, text=idx)
             if idx == self.COL_TIME:
@@ -188,16 +187,22 @@ class LogsPage(Gtk.Box):
                 col.set_cell_data_func(renderer, self._severity_level_cell_data)
             elif idx == self.COL_MESSAGE:
                 col.set_cell_data_func(renderer, self._message_cell_data)
-            col.set_resizable(False)
+            col.set_sort_column_id(idx)
+            col.set_resizable(True)
             col.set_min_width(55)
             col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
             self.tree.append_column(col)
             self.tree_columns[idx] = col
             self.tree_renderers[idx] = renderer
 
+        self.column_sizing = ColumnSizing(
+            [severity_col] + [self.tree_columns[i] for i in range(4)],
+            [None, None, None, None, self.tree_renderers[self.COL_MESSAGE]],
+            self._schedule_reflow, column_widths(getattr(app, 'config', {}), 'logs'))
         self.log_scroll = Gtk.ScrolledWindow()
-        # No horizontal scrollbar is needed: the message cell wraps instead.
-        self.log_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # Automatic horizontal policy lets GTK shrink the viewport below the
+        # table's previous natural width when the window becomes narrower.
+        self.log_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.log_scroll.set_min_content_width(0)
         self.log_scroll.set_hexpand(True)
         self.log_scroll.connect("size-allocate", self._resize_columns)
@@ -207,11 +212,11 @@ class LogsPage(Gtk.Box):
         self.pane.pack1(left, resize=True, shrink=True)
 
         # Details panel. It is allowed to resize/shrink too, and its text wraps.
-        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.details_panel = details
         details.set_no_show_all(True)
         details.get_style_context().add_class("section-card")
-        details.set_border_width(18)
+        details.set_border_width(8)
         details.set_size_request(280, -1)
         dtitle = Gtk.Label(label="Event Details", xalign=0)
         dtitle.get_style_context().add_class("section-title")
@@ -234,7 +239,7 @@ class LogsPage(Gtk.Box):
         self.detail_message.get_style_context().add_class("detail-text")
         dscroll = Gtk.ScrolledWindow()
         dscroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        dscroll.set_min_content_height(250)
+        dscroll.set_min_content_height(72)
         dscroll.add(self.detail_message)
         details.pack_start(dscroll, True, True, 0)
         detail_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -249,17 +254,40 @@ class LogsPage(Gtk.Box):
         copy_btn.connect("clicked", self._copy_selected)
         detail_actions.pack_start(copy_btn, True, True, 0)
         details.pack_start(detail_actions, False, False, 0)
-        self.pane.pack2(details, resize=True, shrink=True)
+        self.pane.pack2(details, resize=False, shrink=False)
         self.pack_start(self.pane, True, True, 0)
 
-        self.connect("map", lambda *_: self.reload())
+        self.text_access = TableTextAccess(
+            self.tree, {self.tree_columns[i]: i for i in range(4)},
+            [('Copy Event', self._copy_selected), ('Copy Message', self._copy_message),
+             ('Show Only This Service', self._show_selected_service),
+             ('Show This Severity', self._show_selected_severity),
+             ('Clear Filters', self._clear_log_filters)], connect=False,
+            on_select=self._hold_for_selection, cell_data=self._selection_cell_data,
+            format_value=lambda index, value: self._friendly_time(value) if index == 0 else value)
+        self.log_scroll.set_margin_bottom(12)
+        self.detail_message.set_bottom_margin(16)
+        selectable_readouts(self)
+        self.connect("map", self._on_map)
         self.connect("destroy", self._on_destroy)
+
+    def _selection_cell_data(self, column, cell, model, itr, index):
+        callback = {self.COL_TIME: self._time_cell_data,
+                    self.COL_LEVEL: self._severity_level_cell_data,
+                    self.COL_MESSAGE: self._message_cell_data}.get(index)
+        if callback:
+            callback(column, cell, model, itr)
+
+    def _hold_for_selection(self):
+        if self.live.get_active():
+            self.live.set_active(False)
 
     @staticmethod
     def _clamp(value, low, high):
         return max(low, min(high, value))
 
     @staticmethod
+    @lru_cache(maxsize=2048)
     def _parse_timestamp(value):
         """Parse SysLogApp's canonical local journal timestamp."""
         try:
@@ -277,16 +305,31 @@ class LogsPage(Gtk.Box):
         if dt is None:
             return str(value or "—")
 
-        today = datetime.now().date()
-        delta_days = (today - dt.date()).days
-        clock = dt.strftime("%H:%M:%S")
-        if delta_days == 0:
-            return f"{clock} · Today"
-        if delta_days == 1:
-            return f"{clock} · Yesterday"
-        if dt.year == datetime.now().year:
-            return f"{clock} · {dt.strftime('%b')} {dt.day}"
-        return f"{clock} · {dt.strftime('%b')} {dt.day}, {dt.year}"
+        now = datetime.now()
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M:%S")
+        return dt.strftime("%m-%d %H:%M:%S" if dt.year == now.year else "%Y-%m-%d %H:%M:%S")
+
+    def _primary_sort_key(self, model, itr, column):
+        if column == self.COL_TIME:
+            raw = model.get_value(itr, self.COL_RAW)
+            if isinstance(raw, dict) and '__REALTIME_TIMESTAMP' in raw:
+                value = raw['__REALTIME_TIMESTAMP']
+            else:
+                value = model.get_value(itr, self.COL_TIME)
+            return timestamp_key(str(value))
+        if column == self.COL_LEVEL:
+            return int(model.get_value(itr, self.COL_PRIORITY))
+        return natural_key(model.get_value(itr, column))
+
+    def _compare_rows(self, model, left, right, column):
+        # Most comparisons finish with the selected field. Fetch the remaining
+        # GTK columns and compute detailed tie-breaks only for equal primaries.
+        primary = compare(self._primary_sort_key(model, left, column),
+                          self._primary_sort_key(model, right, column))
+        if primary:
+            return primary
+        return compare(log_sort_key(tuple(model[left]), column), log_sort_key(tuple(model[right]), column))
 
     def _exact_time(self, raw=None, fallback=None):
         """Recover the precise local timestamp from a journal record."""
@@ -302,37 +345,17 @@ class LogsPage(Gtk.Box):
             return str(fallback)
         return str(fallback or "—")
 
-    def _is_dark_theme(self):
-        settings = Gtk.Settings.get_default()
-        try:
-            return bool(settings.get_property("gtk-application-prefer-dark-theme")) if settings else False
-        except Exception:
-            return False
-
     def _severity_color(self, priority):
-        # Journal priorities: 0 emergency ... 7 debug.  Use a darker palette in
-        # light mode and a brighter palette on dark backgrounds.
-        dark = self._is_dark_theme()
-        if dark:
-            palette = {
-                0: "#ff4d57", 1: "#ff5962", 2: "#ff6b73", 3: "#ff8188",
-                4: "#ffb34c", 5: "#b69cff", 6: "#6aa8ff", 7: "#9aa8b7",
-            }
-        else:
-            palette = {
-                0: "#912018", 1: "#b42318", 2: "#c4322a", 3: "#d92d20",
-                4: "#b54708", 5: "#6941c6", 6: "#175cd3", 7: "#667085",
-            }
         try:
-            return palette.get(int(priority), palette[6])
-        except Exception:
-            return palette[6]
+            return SEVERITY_COLORS.get(int(priority), SEVERITY_COLORS[6])
+        except (ValueError, TypeError):
+            return SEVERITY_COLORS[6]
 
     def _time_cell_data(self, _column, cell, model, itr, _data=None):
-        """Give the compact time value enough contrast to scan quickly."""
-        cell.set_property("text", model.get_value(itr, self.COL_TIME))
+        """Use the event's severity palette for its timestamp too."""
+        cell.set_property("text", self._friendly_time(model.get_value(itr, self.COL_TIME)))
         cell.set_property("weight", Pango.Weight.SEMIBOLD)
-        cell.set_property("foreground", "#b8c7dc" if self._is_dark_theme() else "#344054")
+        cell.set_property("foreground", self._severity_color(model.get_value(itr, self.COL_PRIORITY)))
 
     def _severity_indicator_cell_data(self, _column, cell, model, itr, _data=None):
         priority = model.get_value(itr, self.COL_PRIORITY)
@@ -347,23 +370,10 @@ class LogsPage(Gtk.Box):
         cell.set_property("weight", Pango.Weight.BOLD if int(priority) <= 4 else Pango.Weight.NORMAL)
 
     def _message_color(self, priority):
-        # Message text gets a softer version of the severity palette so the
-        # content itself is scannable without overwhelming the whole table.
-        dark = self._is_dark_theme()
-        if dark:
-            palette = {
-                0: "#ff7a82", 1: "#ff858c", 2: "#ff8f96", 3: "#ff9da3",
-                4: "#f6bd67", 5: "#c2afff", 6: "#8fbcff", 7: "#9aa8b7",
-            }
-        else:
-            palette = {
-                0: "#8f1d16", 1: "#a9241d", 2: "#b92d25", 3: "#c4322a",
-                4: "#9a5200", 5: "#5f46a8", 6: "#245ea8", 7: "#667085",
-            }
         try:
-            return palette.get(int(priority), palette[6])
-        except Exception:
-            return palette[6]
+            return MESSAGE_COLORS.get(int(priority), MESSAGE_COLORS[6])
+        except (ValueError, TypeError):
+            return MESSAGE_COLORS[6]
 
     def _message_cell_data(self, _column, cell, model, itr, _data=None):
         priority = model.get_value(itr, self.COL_PRIORITY)
@@ -371,111 +381,52 @@ class LogsPage(Gtk.Box):
         cell.set_property("weight", Pango.Weight.BOLD if int(priority) <= 3 else Pango.Weight.NORMAL)
 
     def _resize_pane(self, _pane, allocation):
-        """Keep the log/details split useful as the window changes size."""
-        width = int(allocation.width)
+        """Keep the inspector below the journal so messages retain full width."""
+        height = int(allocation.height)
         if not self.details_panel.get_visible():
             self._last_pane_width = 0
             return
-        if width <= 0 or abs(width - self._last_pane_width) < 18:
+        if height <= 0 or abs(height - self._last_pane_width) < 18:
             return
-        self._last_pane_width = width
-        # Roughly 67/33, while preserving a usable details inspector.
-        target = int(width * 0.67)
-        target = max(360, min(target, max(360, width - 285)))
-        if abs(self.pane.get_position() - target) > 10:
-            self.pane.set_position(target)
+        self._last_pane_width = height
+        self.pane.set_position(max(80, int(height * 0.60)))
 
     def _resize_columns(self, _scroll, allocation):
-        """Resize and reflow log rows from the visible viewport width.
-
-        Time, Source and Level stay compact.  Message receives all remaining
-        space and its CellRenderer wrap-width is changed with the window.
-        Changing wrap-width makes GTK recalculate each row's natural height.
-        """
+        # Fit columns to the viewport and wrap the message in its remaining width.
         usable = max(360, int(allocation.width) - 8)
+        widths = {self.COL_TIME: 112, self.COL_UNIT: min(168, max(92, usable // 5)),
+                  self.COL_LEVEL: 70}
+        widths[self.COL_MESSAGE] = max(100, usable - sum(widths.values()) - 38)
+        self.column_sizing.apply_deferred([28] + [widths[i] for i in range(4)])
 
-        # At narrower sizes the metadata columns give up space first so the
-        # actual log message always remains useful.
-        if usable < 650:
-            time_w = self._clamp(int(usable * 0.24), 125, 150)
-            source_w = self._clamp(int(usable * 0.23), 100, 145)
-            level_w = self._clamp(int(usable * 0.12), 68, 82)
-        elif usable < 900:
-            time_w = self._clamp(int(usable * 0.19), 135, 165)
-            source_w = self._clamp(int(usable * 0.23), 125, 185)
-            level_w = self._clamp(int(usable * 0.11), 72, 92)
-        else:
-            time_w = self._clamp(int(usable * 0.15), 145, 175)
-            source_w = self._clamp(int(usable * 0.21), 150, 225)
-            level_w = self._clamp(int(usable * 0.09), 78, 100)
+    def _fit_columns(self, *_):
+        self.column_sizing.reset()
+        self._resize_columns(self.log_scroll, self.log_scroll.get_allocation())
 
-        # Leave a few pixels for TreeView separators / scrollbar allocation.
-        message_w = max(120, usable - 28 - time_w - source_w - level_w - 10)
-        widths = {
-            self.COL_TIME: time_w,
-            self.COL_UNIT: source_w,
-            self.COL_LEVEL: level_w,
-            self.COL_MESSAGE: message_w,
-        }
-
-        changed = False
-        for idx, width in widths.items():
-            col = self.tree_columns.get(idx)
-            if col and abs(col.get_fixed_width() - width) > 2:
-                col.set_fixed_width(width)
-                changed = True
-
-        message_renderer = self.tree_renderers.get(self.COL_MESSAGE)
-        if message_renderer is not None:
-            wrap_width = max(90, message_w - 18)
-            if message_renderer.get_property("wrap-width") != wrap_width:
-                message_renderer.set_property("wrap-width", wrap_width)
-                changed = True
-
-        if changed:
-            # GTK3 caches TreeView row heights aggressively.  queue_resize()
-            # alone is not sufficient for rows that were first measured before
-            # the Message column wrapped.  Debounce a full model row-change pass
-            # so every wrapped row is measured again at the new width.
-            self.tree.queue_resize()
-            self._schedule_row_height_reflow()
-
-    def _schedule_row_height_reflow(self):
-        """Re-measure variable-height log rows after a width change.
-
-        Gtk.TreeView can keep the old one-line height for rows that later wrap
-        to two or more lines.  Emitting row_changed invalidates that cached
-        geometry.  A short debounce avoids doing this repeatedly while the user
-        is actively dragging the window or the paned divider.
-        """
+    def _schedule_reflow(self):
+        # One coalesced pass after resizing, never an idle polling timer.
         if self._destroyed:
             return
-        if self._row_reflow_source:
-            try:
-                GLib.source_remove(self._row_reflow_source)
-            except Exception:
-                pass
-        self._row_reflow_source = GLib.timeout_add(90, self._reflow_row_heights)
+        if self._reflow_source:
+            GLib.source_remove(self._reflow_source)
+        self._reflow_source = GLib.timeout_add(100, self._reflow_rows)
 
-    def _reflow_row_heights(self):
-        self._row_reflow_source = 0
+    def _reflow_rows(self):
+        self._reflow_source = 0
         if self._destroyed:
             return False
-
-        # ListStore is flat, so integer paths are the safest way to walk it
-        # across PyGObject versions (iter_next() has differing Python binding
-        # semantics across GTK releases).
-        for index in range(len(self.store)):
-            path = Gtk.TreePath.new_from_indices([index])
-            try:
-                itr = self.store.get_iter(path)
-                self.store.row_changed(path, itr)
-            except Exception:
-                continue
-
+        # Invalidate GTK's cached heights so expanding also shrinks old wraps.
+        for row in self.store:
+            self.store.row_changed(row.path, row.iter)
         self.tree.queue_resize()
-        self.tree.queue_draw()
+        if self.live.get_active():
+            self._scroll_to_latest()
         return False
+
+    def _on_map(self, *_):
+        if not self._mapped_once:
+            self._mapped_once = True
+            self.reload()
 
     def _filter_changed(self, *_):
         if self._suspend_controls:
@@ -504,11 +455,11 @@ class LogsPage(Gtk.Box):
     def _search_changed(self, *_):
         if not self._suspend_controls:
             self._apply_filter()
-            if self.live.get_active() and not self._live_paused:
+            if self.live.get_active():
                 GLib.idle_add(self._scroll_to_latest)
 
     def navigate(self, priority=None, unit=None, search=None, scope=None):
-        """Apply dashboard-provided filters and display the relevant logs."""
+        """Apply journal filters in one historical query."""
         if self.live.get_active():
             self.live.set_active(False)
         self._suspend_controls = True
@@ -534,11 +485,11 @@ class LogsPage(Gtk.Box):
             return
         self._busy = True
         self.count_label.set_text("Loading…")
-        limit = int(self.app.config.get("log_lines", 400))
+        limit = self.max_rows
         boot_only = self.scope.get_active_id() == "boot"
         prio = self.priority.get_active_text() or "All"
         unit = self.unit.get_text().strip() or None
-        self.app.run_async(lambda: load_logs(limit, boot_only, prio, unit), self._loaded)
+        self.app.run_async(lambda: load_logs(limit, boot_only, prio, unit, host=self.host) if self.host else load_logs(limit, boot_only, prio, unit), self._loaded)
 
     def _loaded(self, result, error):
         if self._destroyed:
@@ -556,8 +507,9 @@ class LogsPage(Gtk.Box):
         # that stale result replace a stream that is already running.
         if self.live.get_active():
             return False
-        self._all_rows = list(result)
+        self._all_rows = list(result)[-self.max_rows:]
         self._apply_filter()
+        GLib.idle_add(self._scroll_to_latest)
         return False
 
     def _apply_filter(self):
@@ -569,19 +521,21 @@ class LogsPage(Gtk.Box):
         if self._destroyed:
             return
         needle = self.search.get_text().strip().lower()
+        column, order = self.store.get_sort_column_id()
         self.store.clear()
-        for item in self._all_rows:
-            hay = f"{item['time']} {item['unit']} {item['level']} {item['message']}".lower()
-            if needle and needle not in hay:
-                continue
-            self.store.append([
-                self._friendly_time(item["time"]), item["unit"], item["level"], item["message"],
-                item["priority"], item["raw"]
-            ])
-        # Initial data may be loaded before the final viewport width is known.
-        # Re-measure rows once GTK has had a chance to allocate the log pane.
-        self._schedule_row_height_reflow()
+        if column is not None:
+            self.store.set_sort_column_id(Gtk.TREE_SORTABLE_UNSORTED_SORT_COLUMN_ID, order)
+        try:
+            for item in self._all_rows:
+                if needle and needle not in self._search_text(item):
+                    continue
+                self.store.append(self._display_row(item))
+        finally:
+            # Sort a completed snapshot once, rather than on every insertion.
+            if column is not None:
+                self.store.set_sort_column_id(column, order)
 
+        self._schedule_reflow()
         if self.live.get_active():
             self._update_live_status()
         else:
@@ -644,35 +598,17 @@ class LogsPage(Gtk.Box):
             self.reload()
 
     def _tree_button_press(self, tree, event):
-        if event.button != 3:
-            return False
-        hit = tree.get_path_at_pos(int(event.x), int(event.y))
-        if not hit:
-            return False
-        path = hit[0]
+        handled = self.text_access.button_press(tree, event)
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            hit = tree.get_path_at_pos(int(event.x), int(event.y))
+            if hit:
+                self._activate_event(tree, hit[0], hit[1])
+                return True
+        return handled
+
+    def _activate_event(self, tree, path, _column):
         tree.get_selection().select_path(path)
-        menu = Gtk.Menu()
-        actions = [
-            ("Copy Event", self._copy_selected),
-            ("Copy Message", self._copy_message),
-            (None, None),
-            ("Show Only This Service", self._show_selected_service),
-            ("Show This Severity", self._show_selected_severity),
-            ("Clear Filters", self._clear_log_filters),
-        ]
-        for label, callback in actions:
-            if label is None:
-                menu.append(Gtk.SeparatorMenuItem())
-                continue
-            item = Gtk.MenuItem(label=label)
-            item.connect("activate", callback)
-            menu.append(item)
-        menu.show_all()
-        try:
-            menu.popup_at_pointer(event)
-        except Exception:
-            menu.popup(None, None, None, None, event.button, event.time)
-        return True
+        self._selection_changed(tree.get_selection(), reveal=True)
 
     def _query_log_tooltip(self, tree, x, y, keyboard_mode, tooltip):
         """Show journal messages as literal text, never as Pango markup."""
@@ -700,7 +636,7 @@ class LogsPage(Gtk.Box):
         except Exception:
             return False
 
-    def _selection_changed(self, selection):
+    def _selection_changed(self, selection, reveal=False):
         model, itr = selection.get_selected()
         if not itr:
             self.details_panel.set_no_show_all(True)
@@ -708,6 +644,8 @@ class LogsPage(Gtk.Box):
             self.detail_meta.set_text("Select a log entry to inspect it.")
             self.detail_message.get_buffer().set_text("")
             self._last_pane_width = 0
+            return
+        if not reveal and not self.details_panel.get_visible():
             return
         when, unit, level, message, _priority, raw = [model.get_value(itr, i) for i in range(6)]
         exact_when = self._exact_time(raw, when)
@@ -732,7 +670,7 @@ class LogsPage(Gtk.Box):
             severity_class = "severity-debug"
         meta_ctx.add_class(severity_class)
         message_ctx.add_class(severity_class)
-        raw_text = message
+        raw_text = str(raw.get("MESSAGE", message)) if isinstance(raw, dict) else message
         if isinstance(raw, dict):
             pid = raw.get("_PID")
             comm = raw.get("_COMM")
@@ -783,31 +721,25 @@ class LogsPage(Gtk.Box):
         except Exception as exc:
             self.app.window.toast(f"Export failed: {exc}", "error")
 
+    def _sync_live_button(self):
+        active = self.live.get_active()
+        self.live.set_label('Live' if active else 'Paused')
+        self.live.set_image(Gtk.Image.new_from_icon_name(
+            'media-playback-start-symbolic' if active else 'media-playback-pause-symbolic', Gtk.IconSize.BUTTON))
+        context = self.live.get_style_context()
+        (context.add_class if active else context.remove_class)('active-live')
+        (context.remove_class if active else context.add_class)('paused-live')
+
     def _on_live(self, button):
+        self._sync_live_button()
         if button.get_active():
+            self.store.set_sort_column_id(self.COL_TIME, Gtk.SortType.ASCENDING)
             self.start_live()
         else:
             self.stop_live()
 
-    def _on_pause_live(self, button):
-        if not self.live.get_active():
-            if button.get_active():
-                button.set_active(False)
-            return
-        self._live_paused = bool(button.get_active())
-        ctx = button.get_style_context()
-        if self._live_paused:
-            self._paused_new_count = 0
-            button.set_label("Resume")
-            button.set_image(Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON))
-            ctx.add_class("paused-live")
-        else:
-            button.set_label("Pause")
-            button.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
-            ctx.remove_class("paused-live")
-            self._paused_new_count = 0
-            GLib.idle_add(self._scroll_to_latest)
-        self._update_live_status()
+    def toggle_pause(self):
+        self.live.set_active(not self.live.get_active())
 
     def _update_live_status(self):
         if self._destroyed or not self.live.get_active():
@@ -815,13 +747,11 @@ class LogsPage(Gtk.Box):
         shown = len(self.store)
         loaded = len(self._all_rows)
         counts = f"{shown} shown" if shown == loaded else f"{shown} shown · {loaded} loaded"
-        if self._live_paused:
-            suffix = f" • {self._paused_new_count} new" if self._paused_new_count else ""
-            self.count_label.set_text(f"LIVE • paused • {counts}{suffix}")
-        else:
-            self.count_label.set_text(f"LIVE • listening • {counts}")
+        if self._stream_dropped:
+            counts += f" · {self._stream_dropped} skipped during bursts"
+        self.count_label.set_text(f"LIVE • listening • {counts}")
 
-    def start_live(self, reset_view=False, include_history=False, preserve_pause=False):
+    def start_live(self, reset_view=False, include_history=False):
         """Start or restart the live journal follower.
 
         Normal Live activation preserves the already-loaded history and follows
@@ -832,19 +762,24 @@ class LogsPage(Gtk.Box):
         """
         if self._destroyed:
             return
-        paused_before = bool(preserve_pause and self._live_paused)
+        # If the initial snapshot is still in flight, let the follower supply
+        # history atomically instead of discarding it when that read completes.
+        if self._busy and not self._all_rows:
+            include_history = True
         self.stop_live(update_button=False)
         self._live_generation += 1
         generation = self._live_generation
-        self._live_error_line = None
-        self._paused_new_count = 0
 
         if reset_view:
             self._all_rows = []
             self.store.clear()
 
-        line_count = int(self.app.config.get("log_lines", 400)) if include_history else 0
-        args = ["journalctl", "--follow", "-n", str(line_count), "--no-pager", "--output=json"]
+        line_count = self.max_rows if include_history else 0
+        args = ["journalctl", "--follow", "-n", str(line_count), "--no-pager", "--output=json", "--output-fields=__REALTIME_TIMESTAMP,PRIORITY,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,_PID,MESSAGE"]
+        if not include_history and self._all_rows:
+            cursor = self._all_rows[-1]["raw"].get("__CURSOR")
+            if cursor:
+                args += ["--after-cursor", cursor]
         if self.scope.get_active_id() == "boot":
             args += ["-b", "0"]
         unit = self.unit.get_text().strip()
@@ -865,7 +800,7 @@ class LogsPage(Gtk.Box):
             args += ["-p", pmap[prio]]
 
         try:
-            self._live_proc = subprocess.Popen(
+            self._live_proc = (self.host.popen if self.host else subprocess.Popen)(
                 args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -880,17 +815,7 @@ class LogsPage(Gtk.Box):
             self.live.set_active(False)
             return
 
-        self.live.get_style_context().add_class("active-live")
-        self.live.set_label("Live ●")
-        self.pause_live.set_sensitive(True)
-        self._live_paused = False
-        if self.pause_live.get_active():
-            self.pause_live.set_active(False)
-        self.pause_live.set_label("Pause")
-        self.pause_live.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
-        self.pause_live.get_style_context().remove_class("paused-live")
-        if paused_before:
-            self.pause_live.set_active(True)
+        self._sync_live_button()
 
         if include_history:
             self.count_label.set_text("LIVE • loading matching history…")
@@ -901,8 +826,7 @@ class LogsPage(Gtk.Box):
             target=self._live_reader, args=(self._live_proc, generation), daemon=True
         )
         self._live_thread.start()
-        if not self._live_paused:
-            GLib.idle_add(self._scroll_to_latest)
+        GLib.idle_add(self._scroll_to_latest)
 
     def _live_reader(self, proc, generation):
         if not proc or not proc.stdout:
@@ -923,6 +847,9 @@ class LogsPage(Gtk.Box):
                     diagnostic = line[:500]
                     continue
 
+                if not isinstance(obj, dict):
+                    diagnostic = "Invalid journal record"
+                    continue
                 ts = obj.get("__REALTIME_TIMESTAMP")
                 try:
                     when = datetime.fromtimestamp(int(ts) / 1_000_000).strftime("%Y-%m-%d %H:%M:%S") if ts else "—"
@@ -940,57 +867,81 @@ class LogsPage(Gtk.Box):
                     "message": msg,
                     "raw": obj,
                 }
-                GLib.idle_add(self._append_live, row, generation)
+                self._queue_live(row, generation)
         finally:
+            proc.stdout.close()
             try:
                 rc = proc.poll()
             except Exception:
                 rc = None
             GLib.idle_add(self._live_exited, proc, generation, rc, diagnostic)
 
-    def _append_live(self, item, generation):
-        if self._destroyed:
-            return False
-        if generation != self._live_generation or not self.live.get_active():
-            return False
-        self._all_rows.append(item)
-        if len(self._all_rows) > 1500:
-            self._all_rows = self._all_rows[-1200:]
+    def _queue_live(self, item, generation):
+        """A bounded inbox, with one demand-driven UI wakeup per batch."""
+        with self._pending_lock:
+            if self._destroyed or generation != self._live_generation:
+                return
+            if len(self._pending_rows) == self.max_rows:
+                self._dropped_pending += 1
+            self._pending_rows.append(item)
+            if not self._drain_source:
+                self._drain_source = GLib.timeout_add(100, self._drain_live, generation)
 
+    def _drain_live(self, generation):
+        with self._pending_lock:
+            self._drain_source = 0
+            if self._destroyed or generation != self._live_generation:
+                return False
+            batch = list(self._pending_rows)
+            self._pending_rows.clear()
+            self._stream_dropped += self._dropped_pending
+            self._dropped_pending = 0
+        if not self.live.get_active():
+            return False
+        if not batch:
+            return False
+        # Update the model incrementally; never rebuild the table per event.
+        overflow = max(0, len(self._all_rows) + len(batch) - self.max_rows)
+        self._all_rows.extend(batch)
+        del self._all_rows[:-self.max_rows]
         needle = self.search.get_text().strip().lower()
-        hay = f"{item['time']} {item['unit']} {item['level']} {item['message']}".lower()
-        if not needle or needle in hay:
-            itr = self.store.append([
-                self._friendly_time(item["time"]), item["unit"], item["level"], item["message"],
-                item["priority"], item["raw"],
-            ])
-            if len(self.store) > 1200:
-                first = self.store.get_iter_first()
-                if first:
-                    self.store.remove(first)
-
-            # Ensure a newly appended wrapped message receives its natural
-            # multi-line height even if TreeView geometry is currently cached.
-            path = self.store.get_path(itr)
-            if path is not None:
-                self.store.row_changed(path, itr)
-
-            if self._live_paused:
-                self._paused_new_count += 1
-                self._update_live_status()
-            else:
-                self._update_live_status()
-                path = self.store.get_path(itr)
-                if path is not None:
-                    self.tree.scroll_to_cell(path, None, True, 1.0, 0.0)
-        else:
-            self._update_live_status()
+        if overflow:
+            # Sorted rows can put expired history anywhere in the model.
+            retained = {id(item["raw"]) for item in self._all_rows}
+            for index in range(len(self.store) - 1, -1, -1):
+                itr = self.store.iter_nth_child(None, index)
+                if id(self.store.get_value(itr, self.COL_RAW)) not in retained:
+                    self.store.remove(itr)
+        shown = 0
+        for item in batch:
+            if needle and needle not in self._search_text(item):
+                continue
+            self.store.append(self._display_row(item))
+            shown += 1
+        while len(self.store) > self.max_rows:
+            self.store.remove(self.store.get_iter_first())
+        if shown:
+            self._scroll_to_latest()
+        self._update_live_status()
         return False
+
+    @staticmethod
+    def _search_text(item):
+        return f"{item['time']} {item['unit']} {item['level']} {item['message']}".lower()
+
+    def _display_row(self, item):
+        return [item["time"], item["unit"], item["level"],
+                item["message"], item["priority"], item["raw"]]
 
     def _scroll_to_latest(self):
         if self._destroyed or len(self.store) <= 0:
             return False
-        itr = self.store.iter_nth_child(None, len(self.store) - 1)
+        column, order = self.store.get_sort_column_id()
+        # Respect a user's source/severity/message sort without jumping the view.
+        if column != self.COL_TIME:
+            return False
+        index = 0 if order == Gtk.SortType.DESCENDING else len(self.store) - 1
+        itr = self.store.iter_nth_child(None, index)
         if itr:
             path = self.store.get_path(itr)
             self.tree.scroll_to_cell(path, None, True, 1.0, 0.0)
@@ -1003,13 +954,14 @@ class LogsPage(Gtk.Box):
         # callback runs, so only unexpected exits reach the user.
         if generation != self._live_generation or proc is not self._live_proc:
             return False
+        with self._pending_lock:
+            pending = bool(self._pending_rows)
+            if self._drain_source:
+                GLib.source_remove(self._drain_source)
+                self._drain_source = 0
+        if pending:
+            self._drain_live(generation)
         self._live_proc = None
-        self.live.get_style_context().remove_class("active-live")
-        self.live.set_label("Live")
-        self.pause_live.set_sensitive(False)
-        if self.pause_live.get_active():
-            self.pause_live.set_active(False)
-        self._live_paused = False
         if self.live.get_active():
             self.live.set_active(False)
         detail = diagnostic or (f"journalctl exited with status {rc}" if rc is not None else "journalctl stopped")
@@ -1025,7 +977,13 @@ class LogsPage(Gtk.Box):
         """
         proc = self._live_proc
         self._live_proc = None
-        self._live_generation += 1
+        with self._pending_lock:
+            self._live_generation += 1
+            if self._drain_source:
+                GLib.source_remove(self._drain_source)
+                self._drain_source = 0
+            self._pending_rows.clear()
+            self._dropped_pending = 0
         if proc:
             try:
                 proc.terminate()
@@ -1042,12 +1000,10 @@ class LogsPage(Gtk.Box):
         # have finalized those child GObjects.  Just invalidate callbacks and
         # stop the subprocess.
         self._destroyed = True
-        if self._row_reflow_source:
-            try:
-                GLib.source_remove(self._row_reflow_source)
-            except Exception:
-                pass
-            self._row_reflow_source = 0
+        self.column_sizing.cancel_pending()
+        if self._reflow_source:
+            GLib.source_remove(self._reflow_source)
+            self._reflow_source = 0
         self._terminate_live_process()
 
     def stop_live(self, update_button=True):
@@ -1055,18 +1011,9 @@ class LogsPage(Gtk.Box):
         if self._destroyed:
             return
 
-        self.live.get_style_context().remove_class("active-live")
-        self.live.set_label("Live")
-        self.pause_live.set_sensitive(False)
-        self._live_paused = False
-        self._paused_new_count = 0
-        if self.pause_live.get_active():
-            self.pause_live.set_active(False)
-        self.pause_live.set_label("Pause")
-        self.pause_live.set_image(Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON))
-        self.pause_live.get_style_context().remove_class("paused-live")
         if update_button and self.live.get_active():
             self.live.set_active(False)
+        self._sync_live_button()
         if update_button:
             shown = len(self.store)
             loaded = len(self._all_rows)

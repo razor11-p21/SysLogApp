@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import tarfile
+import runpy
 from datetime import datetime
 from pathlib import Path
 
@@ -35,9 +36,22 @@ with tarfile.open(backup / 'previous-installation.tar.gz', 'w:gz') as archive:
 
 subprocess.run(['bash', str(workspace / 'install.sh')], cwd=workspace, check=True)
 installed = user_home / '.local/share/syslogapp/syslogapp/__init__.py'
-if '2.0.0-preview18' not in installed.read_text():
+expected_version = runpy.run_path(str(workspace / 'syslogapp/__init__.py'))['__version__']
+if expected_version not in installed.read_text():
     raise RuntimeError('Installed version verification failed')
 shutil.copytree(workspace / 'cinnamon' / uuid, applet_target, dirs_exist_ok=True)
+# This explicitly requested desktop setup refreshes the app's icon while keeping
+# the existing launcher command and all other custom desktop fields intact.
+desktop = user_home / '.local/share/applications/syslogapp.desktop'
+icon_path = user_home / '.local/share/syslogapp/syslogapp/assets/syslogapp.svg'
+if desktop.exists():
+    from install_user import replace_file
+    lines = desktop.read_text().splitlines()
+    lines = [f'Icon={icon_path}' if line.startswith('Icon=') else line for line in lines]
+    if not any(line.startswith('Icon=') for line in lines):
+        lines.append(f'Icon={icon_path}')
+    replace_file(desktop, ('\n'.join(lines) + '\n').encode(), desktop.stat().st_mode & 0o777)
+
 
 existing = [item for item in enabled if item.split(':')[3] == uuid]
 if existing:
@@ -55,6 +69,6 @@ else:
     Gio.Settings.sync()
 if entry not in settings.get_strv('enabled-applets'):
     raise RuntimeError('Panel applet setting was not saved')
-print('Installed version: 2.0.0-preview18')
+print('Installed version:', expected_version)
 print('Applet enabled:', entry)
 print('Backup:', backup)

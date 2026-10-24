@@ -37,14 +37,14 @@ def package(stage, name, version, maintainer, depends, description, destination)
     write(doc / 'copyright', copyright_text)
     shutil.copy2(ROOT / 'NOTICE.md', doc / 'NOTICE.md')
     shutil.copy2(ROOT / 'AUTHORS', doc / 'AUTHORS')
-    changelog = f'{name} ({version}) unstable; urgency=medium\n\n  * Prepare GPL-licensed public beta with dependency and maintenance hardening.\n\n -- {maintainer}  Sat, 03 Oct 2026 00:00:00 +0300\n'
+    changelog = f'{name} ({version}) unstable; urgency=medium\n\n  * Improve live controls, event details, host identity, menu theming and horizontal resize responsiveness.\n\n -- {maintainer}  Sun, 25 Oct 2026 00:00:00 +0300\n'
     (doc / 'changelog.Debian.gz').write_bytes(gzip.compress(changelog.encode(), mtime=0))
     files = sorted(path for path in stage.rglob('*') if path.is_file())
     installed_size = sum(path.stat().st_size for path in files) // 1024 + 1
     write(stage / 'DEBIAN/control', f'Package: {name}\nVersion: {version}\nSection: utils\nPriority: optional\nArchitecture: all\nMaintainer: {maintainer}\nInstalled-Size: {installed_size}\nDepends: {depends}\nDescription: {description}\n')
     if name == 'syslogapp':
         with (stage / 'DEBIAN/control').open('a') as control:
-            control.write('Recommends: pkexec, polkitd\nSuggests: syslogapp-cinnamon-applet\n')
+            control.write('Suggests: syslogapp-cinnamon-applet, pkexec, logrotate, gir1.2-secret-1, gnome-keyring\n')
     checksums = ''.join(hashlib.md5(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(stage)) + '\n' for path in files)
     write(stage / 'DEBIAN/md5sums', checksums)
     for path in stage.rglob('*'):
@@ -67,7 +67,7 @@ def build(draft=False):
     version = metadata['version']
     if draft:
         version = version.replace('-1', '+draft1-1')
-    destination = ROOT / 'dist' / ('draft' if draft else 'preview19')
+    destination = ROOT / 'dist' / ('draft' if draft else 'preview48')
     destination.mkdir(parents=True, exist_ok=True)
     maintainer = f"{metadata['author']} <{email}>"
     with tempfile.TemporaryDirectory(prefix='syslogapp-build-') as temporary:
@@ -81,17 +81,20 @@ def build(draft=False):
         desktop.parent.mkdir(parents=True)
         shutil.copy2(ROOT / 'packaging/syslogapp.desktop', desktop)
         subprocess.run(['desktop-file-validate', str(desktop)], check=True)
+        icon = stage / 'usr/share/icons/hicolor/scalable/apps/syslogapp.svg'
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / 'syslogapp/assets/syslogapp.svg', icon)
         docs = stage / 'usr/share/doc/syslogapp'
         docs.mkdir(parents=True)
-        for name in ('README.md', 'RELEASE.md'):
+        for name in ('README.md', 'RELEASE.md', 'PERFORMANCE.md'):
             shutil.copy2(ROOT / name, docs / name)
         man = stage / 'usr/share/man/man1/syslogapp.1.gz'
         man.parent.mkdir(parents=True)
         man.write_bytes(gzip.compress((ROOT / 'packaging/syslogapp.1').read_bytes(), mtime=0))
         # dpkg and libc-bin/getent are Essential Debian packages, implicitly available.
-        dependencies = 'python3 (>= 3.9), python3-gi, python3-gi-cairo, python3-cairo, gir1.2-gtk-3.0, python3-psutil, systemd, iproute2, iputils-ping, apt'
+        dependencies = 'python3 (>= 3.9), python3-gi, gir1.2-gtk-3.0, systemd, iproute2, openssh-client'
         results = [package(stage, 'syslogapp', version, maintainer, dependencies,
-                           'Linux system health and troubleshooting desktop application\n GTK3 application for journal logs, resource monitoring, network inspection,\n and explicit system maintenance on systemd-based Mint/Ubuntu desktops.', destination)]
+                           'terminal-style journal and network viewer\n Compact GTK3 journal viewer with bounded history, filters, event details,\n batched live following and on-demand network snapshots.', destination)]
         stage = Path(temporary) / 'applet'
         applet = stage / 'usr/share/cinnamon/applets/syslogapp@razor'
         shutil.copytree(ROOT / 'cinnamon/syslogapp@razor', applet)
@@ -99,7 +102,7 @@ def build(draft=False):
                                f'syslogapp (= {version}), cinnamon',
                                'optional Cinnamon panel launcher for SysLogApp\n Adds an applet available in Cinnamon Applets settings.\n It does not change panel preferences or enable itself automatically.', destination))
     archive = destination / f'SysLogApp-{version}-source.tar.gz'
-    names = ['LICENSE', 'AUTHORS', 'NOTICE.md', 'README.md', 'RELEASE.md', 'install.sh',
+    names = ['LICENSE', 'AUTHORS', 'NOTICE.md', 'README.md', 'RELEASE.md', 'PERFORMANCE.md', 'install.sh',
              'uninstall.sh', 'run-preview.sh', 'syslogapp.py', 'syslogapp', 'cinnamon', 'scripts', 'tests', 'packaging']
     def clean(info):
         return None if '__pycache__' in Path(info.name).parts or info.name.endswith(('.pyc', '.pyo')) else info

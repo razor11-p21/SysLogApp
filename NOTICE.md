@@ -12,12 +12,10 @@ bundled in the SysLogApp packages, and each retains its own license:
 - Python: https://www.python.org/ — Python Software Foundation license.
 - GTK3, GLib/GIO, and Pango: https://www.gtk.org/ — LGPL family licenses.
 - PyGObject: https://pygobject.gnome.org/ — LGPL-2.1-or-later.
-- Cairo and Pycairo: https://www.cairographics.org/ — see their license notices.
-- psutil: https://github.com/giampaolo/psutil — BSD-3-Clause.
 - Cinnamon (optional applet host): https://github.com/linuxmint/cinnamon — GPL-2.0-or-later.
-- systemd, iproute2, iputils, glibc/getent, polkit, APT, and dpkg are invoked as
-  host tools and remain subject to their respective project licenses.
+- iproute2 (ip/ss): https://wiki.linuxfoundation.org/networking/iproute2 — see upstream licenses.
+- systemd/journalctl: https://systemd.io/ — see the upstream license notices.
 
-The application uses the desktop's existing system-monitor icon. No upstream
-icon artwork is bundled. The dashboard concept image is excluded from release
-packages; it is not an application screenshot.
+The custom SysLogApp icon (log lines and network nodes) was created for this
+project. It is distributed under GPL-3.0-or-later with the application.
+Copyright (C) 2026 pit pitopoulos. No upstream icon artwork is bundled.

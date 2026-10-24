@@ -1,30 +1,116 @@
-.TH SYSLOGAPP 1 "October 2026" "SysLogApp Preview 19" "User Commands"
+.TH SYSLOGAPP 1 "October 2026" "SysLogApp Preview 41" "User Commands"
 .SH NAME
-syslogapp \- Linux system health and troubleshooting desktop application
+syslogapp \- terminal-style journal and network viewer
 .SH SYNOPSIS
 .B syslogapp
 .SH DESCRIPTION
-SysLogApp is a GTK3 desktop application for resource monitoring, journal logs,
-network inspection, diagnostics, and explicit maintenance on systemd-based
-Linux Mint and Ubuntu systems.
+SysLogApp is a compact GTK3 journal viewer with current-boot/history, severity,
+service and local text filters. Select a record to inspect the complete message.
+The viewer runs as the current user; journal access depends on user permissions.
 .PP
-The application runs as the current user. Administrative maintenance actions
-request authorization through PolicyKit. Journal visibility and socket ownership
-information depend on the user's permissions.
+The initial view is a snapshot. Enable Live to follow new events. Hold scroll
+suspends automatic scrolling while collection continues. Retained history and
+pending updates are bounded. During overload, skipped pending records are counted
+in the status. Log viewing never modifies the on-disk journal.
+.SH HOSTS
+The collapsible Hosts sidebar selects Local or saved SSH profiles. Password and
+SSH key/agent login are supported; passwords/passphrases and key contents are
+never saved. Unknown host keys require confirmation; changed keys are rejected.
+Reconnect retries login; Disconnect returns to Local. A single active OpenSSH
+multiplexed session supplies all four tabs. Switching closes old readers/session,
+frees old pages and ignores late callbacks. No profiles auto-connect at startup.
 .PP
-Administrative actions do not have a fixed execution timeout. Allow them to
-finish before closing the application. Package recovery requiring interactive
-input must be completed in a terminal.
+All commands use the selected host. Remote System logs requires journalctl and
+journal access; Network needs ip/ss; Overview and rotation helpers need Python 3.8+.
+Missing tools disable features or report Unavailable without using local data.
+Remote administrative actions use sudo/root and target-specific confirmation.
+Host changes and closing are blocked during maintenance. A failed SSH transport
+can leave a remote administrative operation running; inspect before retrying.
+Remote journal snapshots have a 16 MiB output limit. Journal timestamps are shown
+in the client's local timezone. Host profiles are stored with normal app settings.
+.SH NETWORK
+The Network tab shows local interfaces, addresses, default routes and TCP/UDP
+sockets. It collects once when first opened. Refresh collects on demand; Live enables
+automatic updates approximately every two seconds while visible. Pause holds
+the snapshot, Resume restarts updates, and hiding the tab suspends polling.
+Reads never overlap; collection errors cause backoff up to 30 seconds. Search and
+filters operate on loaded data. Hide TIME-WAIT optionally hides closed sockets
+awaiting expiry, without another scan. It combines with search/type filters and
+stays applied across refresh/live updates while the app is open. Processes enables additional process lookup on
+the next refresh. Process visibility depends on user permissions.
+.PP
+Network snapshots are bounded to 1000 sockets and 128 interfaces. Each collection
+command has a 3-second timeout and a 512 KiB output budget. Numeric addresses avoid
+DNS lookups. No external reachability probes run. No network timer runs when Live is off,
+paused or the Network tab is hidden.
+Columns are grouped as Proto/State, Local address/port, Remote address/port
+and optional Process/PID at the end. Flat headers identify Local address, Local
+port, Remote address and Remote port. Columns remain separately sortable and resizable. Both address columns fit their loaded data with trailing
+spare space, keeping each port nearby. Manual widths take precedence. Copy socket
+follows the visual column order. All Network headers and values align left,
+including wrapped text. Column widths
+fit the window and text wraps as needed. Active connections are blue, listeners
+purple, idle/closing sockets gray and CLOSE-WAIT amber. Ordinary endpoint text
+uses quiet colors. Ports are amber, PIDs are blue and process names are purple.
+PID and Process are separate columns. Extended processes optionally shows full
+loaded socket metadata including descriptors; it performs no additional scan.
+Tooltips and Copy socket retain complete process metadata.
+.SH OVERVIEW AND MAINTENANCE
+Overview loads a local system snapshot on first opening and manual Refresh only.
+It shows system identity, uptime, CPU/load, memory/swap and root filesystem usage.
+It does not sample CPU percentages or run background checks.
+.PP
+Maintenance actions run only when selected. Changes require confirmation and
+pkexec administrator authentication. Missing optional tools disable their actions.
+Administrative operations use a separate worker without a fixed timeout. Keep the
+app open until completion; window closing is blocked while an action runs.
+Command output is temporarily stored on disk; only the last 128 KiB is displayed.
+Read-only journal usage has a 5-second timeout and 64 KiB output limit.
+Ctrl+R on Maintenance rechecks executable availability on the selected host.
+.SH TEXT LOG ROTATION
+Maintenance includes a logrotate editor for one regular file under /var/log.
+Choose schedule, retained archives, compression, size threshold and rename or
+copytruncate. Rename requires the writer to reopen; no reopen hook is added.
+Copytruncate can lose concurrent writes. The system timer/cron job controls when
+rotation settings are evaluated.
+.PP
+Saving requires review and pkexec authentication. The helper validates a staged
+full configuration with logrotate --debug, backs up previous app-managed settings
+under /var/backups/syslogapp and atomically saves /etc/logrotate.d/syslogapp.
+Validation failures and duplicate rules leave configuration unchanged. Saving does
+not rotate logs. Distro-owned rules are not edited. Logrotate is optional.
+.SH RESIZING
+Drag header dividers in Logs, Network and Overview to resize columns. Fit columns
+restores automatic window fitting. Text rewraps after dragging; manual widths
+survive refresh, window resizing and app restarts and may require horizontal scrolling.
+Window size, maximized state and per-tab manual widths are saved atomically on
+normal close. Unopened tabs retain their saved widths. Fit columns clears saved
+overrides for that tab. No settings are written continuously while resizing.
+Overview displays a built-in ASCII logo without running neofetch.
+.SH SORTING
+Click a table header to sort; click again to reverse. Logs open oldest first, with newest entries last.
+Time sorting uses full journal timestamps, and severity sorting uses journal
+priority. Network addresses and ports sort numerically. State sorting groups
+established connections, listeners, handshakes, closing and unconnected sockets.
+Selected sorts survive refresh and live updates. Enabling Live restores ascending
+Time order and jumps to the newest visible entry at the bottom. Interfaces and routes can be
+expanded above the socket table. Full timestamps remain in tooltips and details.
+.SH RESOURCE USE
+Network refreshes retain unchanged table rows instead of rebuilding the table.
+Sorting computes tie-break fields only when needed. Long strings bypass global
+sort caches; retained messages are not truncated. Date parsing caches are bounded.
+No new background sampling or refresh timers are introduced.
+.SH KEYBOARD
+Ctrl+K or Ctrl+F focuses search. Ctrl+R refreshes the selected tab. Escape closes event details.
 .SH FILES
 .TP
 .I ~/.config/syslogapp/config.json
-User preferences. Package installation and removal do not modify this file.
+The log_lines preference defaults to 400 and is clamped to 100 through 2000.
 .SH LICENSE
 GNU General Public License, version 3 or any later version.
 .SH AUTHOR
 pit pitopoulos.
 .SH SEE ALSO
 .BR journalctl (1),
-.BR systemctl (1),
-.BR ip (8),
-.BR pkexec (1)
+.BR ss (8),
+.BR ip (8)
