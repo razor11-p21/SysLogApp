@@ -97,7 +97,6 @@ class MaintenancePage(Gtk.Box):
             renderer.set_property('ellipsize', Pango.EllipsizeMode.END)
             renderer.set_property('max-width-chars', 45)
             renderer.set_property('width-chars', 20)
-        self.history.set_tooltip_text('Last 10 results from this app session, including host and exit status')
         self._history_guard = False
         self.history.connect('changed', self._history_selected)
         output_box.pack_start(self.history, False, False, 0)
@@ -114,8 +113,6 @@ class MaintenancePage(Gtk.Box):
         self.pack_start(self.split, True, True, 0)
         self.connect('destroy', self._destroy)
         selectable_readouts(self)
-        # Start keyboard focus on a control, not the selectable introductory text.
-        self.set_focus_chain([self.refresh_button, self.split])
         self._refresh_clicked()
 
     @staticmethod
@@ -203,7 +200,6 @@ class MaintenancePage(Gtk.Box):
         self.rotation_keep = Gtk.SpinButton.new_with_range(1, 52, 1)
         self.rotation_keep.set_value(4)
         self.rotation_size = Gtk.SpinButton.new_with_range(0, 102400, 1)
-        self.rotation_size.set_tooltip_text('0 disables the size threshold; evaluated when the system scheduler runs logrotate')
         self.rotation_mode = Gtk.ComboBoxText()
         self.rotation_mode.append('rename', 'Rename · writer must reopen')
         self.rotation_mode.append('copytruncate', 'Copy/truncate · possible data loss')
@@ -366,7 +362,6 @@ class MaintenancePage(Gtk.Box):
         for button, action in self._buttons:
             args, reason = self._resolve(action)
             button.set_sensitive(bool(args) and not self._busy and not self._probing)
-            button.set_tooltip_text(reason or action.description)
             label, text = self._availability_labels[button]
             label.set_text(text + ('\nUnavailable: ' + reason if reason else ''))
 
@@ -379,13 +374,12 @@ class MaintenancePage(Gtk.Box):
                           getattr(self.host, 'python_ready', True) and
                           (self.host.uid == 0 or self.host.which('sudo'))) if self.host else
                      bool(shutil.which('logrotate') and shutil.which('pkexec')))
+        available = available and (not self.host or getattr(self.host, 'connected', True))
         self.rotation_save.set_sensitive(available and self._rotation_valid and not self._busy and not self._probing)
         self.rotation_validate.set_sensitive(available and self._rotation_valid and not self._busy and not self._probing)
         self.history.set_sensitive(not self._busy)
         self.output_menu.get_popup().get_children()[2].set_sensitive(not self._busy)
         self.rotation_availability.set_text(('Unavailable: remote logrotate, Python 3.8+ and sudo/root required' if self.host else 'Unavailable: logrotate and pkexec required') if not available else 'Validate and Save require administrator authentication; validation changes no files.')
-        self.rotation_save.set_tooltip_text(('Remote logrotate, Python 3.8+ and sudo/root required' if self.host else
-                                           'Requires logrotate and pkexec') if not available else 'Review the configuration before authentication')
 
     def refresh_available(self, *_):
         if self._busy or self._probing:
@@ -407,6 +401,8 @@ class MaintenancePage(Gtk.Box):
 
     def _resolve(self, action):
         host = getattr(self, 'host', None)
+        if host and not getattr(host, 'connected', True):
+            return None, 'SSH disconnected · reconnect before running maintenance. Previous actions are never repeated automatically.'
         return host.resolve_action(action) if host else resolve(action)
 
     def _confirm(self, action, args):

@@ -1,6 +1,8 @@
 {
-  "version": "2.0.0~preview48-1",
+  "version": "2.0.0~alpha1-1",
   "author": "pit pitopoulos",
   "maintainer_email": "218387257+razor11-p21@users.noreply.github.com",
-  "license": "GPL-3.0-or-later"
+  "license": "GPL-3.0-or-later",
+  "release_tag": "v2.0.0-alpha.1",
+  "release_directory": "alpha1"
 }

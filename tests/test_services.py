@@ -46,3 +46,19 @@ class JournalTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertEqual(args[args.index('-n') + 1], '2000')
         self.assertTrue(any(arg.startswith('--output-fields=') for arg in args))
+
+    def test_unusual_journal_fields_are_safe_for_gtk_and_raw_is_preserved(self):
+        for priority in (None, ['3'], {}, '-1', '99', '9' * 5000):
+            raw = {'PRIORITY': priority, 'SYSLOG_IDENTIFIER': ['first', 'second'],
+                   'MESSAGE': 'hello\nworld', '__REALTIME_TIMESTAMP': []}
+            row = s.journal_row(raw)
+            self.assertEqual(row['priority'], 6)
+            self.assertEqual(row['level'], 'Info')
+            self.assertIsInstance(row['unit'], str)
+            self.assertEqual(row['time'], '—')
+            self.assertEqual(row['message'], 'hello world')
+            self.assertIs(row['raw'], raw)
+        for priority in range(8):
+            row = s.journal_row({'PRIORITY': priority})
+            self.assertEqual(row['priority'], priority)
+            self.assertEqual(row['level'], s.PRIORITY_LABELS[str(priority)])

@@ -79,12 +79,14 @@ class CredentialTests(unittest.TestCase):
             gtk.CheckButton.return_value.get_active.return_value = checked
             with patch.object(ssh_askpass, 'Gtk', gtk), patch.object(ssh_askpass, 'Gdk', Mock()), \
                  patch.object(ssh_askpass, 'password_store', return_value=(store, None, '')), \
-                 patch.object(ssh_askpass.sys, 'argv', ['askpass', 'Password:']), redirect_stdout(output):
+                 patch.object(ssh_askpass.sys, 'argv', ['askpass', 'Password:']), \
+                 patch('syslogapp.pending_password.send', return_value=True) as stage, redirect_stdout(output):
                 self.assertEqual(ssh_askpass.main(), int(canceled))
             if checked and not canceled:
-                store.save.assert_called_once_with('fixture-secret')
+                stage.assert_called_once_with('fixture-secret')
             else:
-                store.save.assert_not_called()
+                stage.assert_not_called()
+            store.save.assert_not_called()
             gtk.CheckButton.return_value.set_active.assert_called_once_with(False)
             self.assertEqual(output.getvalue(), '' if canceled else 'fixture-secret\n')
 
@@ -96,7 +98,8 @@ class CredentialTests(unittest.TestCase):
         store.save.side_effect = CredentialError('unavailable')
         with patch.object(ssh_askpass, 'Gtk', gtk), patch.object(ssh_askpass, 'Gdk', Mock()), \
              patch.object(ssh_askpass, 'password_store', return_value=(store, None, '')), \
-             patch.object(ssh_askpass.sys, 'argv', ['askpass', 'Password:']), redirect_stdout(output):
+             patch.object(ssh_askpass.sys, 'argv', ['askpass', 'Password:']), \
+             patch('syslogapp.pending_password.send', return_value=False), redirect_stdout(output):
             self.assertEqual(ssh_askpass.main(), 1)
         self.assertEqual(output.getvalue(), '')
         self.assertEqual(gtk.Dialog.return_value.run.call_count, 2)

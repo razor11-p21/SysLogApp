@@ -4,6 +4,7 @@
 import json
 import os
 import selectors
+import signal
 import subprocess
 import time
 from datetime import datetime
@@ -13,7 +14,7 @@ MAX_SOCKETS = 1000
 MAX_INTERFACES = 128
 
 
-def capture(args, timeout=3, max_bytes=MAX_BYTES, env=None, popen_factory=None):
+def capture(args, timeout=3, max_bytes=MAX_BYTES, env=None, popen_factory=None, return_stderr=False):
     """Drain both pipes within a byte/time budget; never buffer unlimited output."""
     kwargs = dict(stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE, start_new_session=True)
@@ -23,6 +24,7 @@ def capture(args, timeout=3, max_bytes=MAX_BYTES, env=None, popen_factory=None):
     chunks = {'out': bytearray(), 'err': bytearray()}
     truncated = False
     deadline = time.monotonic() + timeout
+    completed = False
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(proc.stdout, selectors.EVENT_READ, 'out')
@@ -45,9 +47,15 @@ def capture(args, timeout=3, max_bytes=MAX_BYTES, env=None, popen_factory=None):
                     break
             if not truncated:
                 proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+                completed = True
     finally:
-        if proc.poll() is None:
-            proc.kill()
+        if not completed or proc.poll() is None:
+            # Helpers can outlive their parent and retain its pipes. Every
+            # capture starts a private session; clean up that whole group.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         proc.wait()
         proc.stdout.close()
         proc.stderr.close()
@@ -60,7 +68,7 @@ def capture(args, timeout=3, max_bytes=MAX_BYTES, env=None, popen_factory=None):
     # A byte cap may cut a socket row in half. Never display that partial row.
     if truncated:
         out = out.rsplit('\n', 1)[0] if '\n' in out else ''
-    return out, truncated
+    return (out, truncated, error) if return_stderr else (out, truncated)
 
 
 def socket_rows(text, limit=MAX_SOCKETS):
@@ -95,24 +103,35 @@ def _json_command(args, host=None):
     return data
 
 
-def snapshot(include_processes=False, host=None):
+def snapshot(include_processes=False, host=None, cached=None):
     result = {'interfaces': None, 'sockets': None, 'routes': [], 'errors': [],
               'limited': False, 'time': datetime.now().strftime('%H:%M:%S'),
               'processes': include_processes}
-    try:
-        interfaces = _json_command(['ip', '-j', 'address', 'show'], host)
-        result['limited'] = len(interfaces) > MAX_INTERFACES
-        result['interfaces'] = interfaces[:MAX_INTERFACES]
-    except Exception as exc:
-        result['errors'].append(f'Interfaces: {str(exc)[:300]}')
-    # Two cheap local route queries cover both address families; no reachability probes.
-    for family in ('-4', '-6'):
+    # Cache belongs to the page/host; never share interface data across hosts.
+    result['details_refreshed'] = cached is None
+    result['details_time'] = (cached.get('details_time', cached.get('time', 'unknown'))
+                              if cached is not None else result['time'])
+    if cached is not None:
+        result['interfaces'] = cached['interfaces']
+        result['routes'] = cached['routes']
+        result['errors'].extend(e for e in cached['errors'] if not e.startswith('Sockets:'))
+        result['limited'] = cached.get('details_limited', False)
+    else:
         try:
-            routes = _json_command(['ip', '-j', family, 'route', 'show', 'default'], host)
-            result['routes'].extend(routes[:32])
-            result['limited'] |= len(routes) > 32
+            interfaces = _json_command(['ip', '-j', 'address', 'show'], host)
+            result['limited'] = len(interfaces) > MAX_INTERFACES
+            result['interfaces'] = interfaces[:MAX_INTERFACES]
         except Exception as exc:
-            result['errors'].append(f'{family} routes: {str(exc)[:300]}')
+            result['errors'].append(f'Interfaces: {str(exc)[:300]}')
+        # Two cheap local route queries cover both address families; no reachability probes.
+        for family in ('-4', '-6'):
+            try:
+                routes = _json_command(['ip', '-j', family, 'route', 'show', 'default'], host)
+                result['routes'].extend(routes[:32])
+                result['limited'] |= len(routes) > 32
+            except Exception as exc:
+                result['errors'].append(f'{family} routes: {str(exc)[:300]}')
+    result['details_limited'] = result['limited']
     try:
         args = ['ss', '-H', '-t', '-u', '-n', '-a', '-O']
         if include_processes:

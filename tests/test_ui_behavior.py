@@ -275,7 +275,7 @@ class TerminalTests(unittest.TestCase):
                  {'__REALTIME_TIMESTAMP':str(i%3)} if i%4 else {'__REALTIME_TIMESTAMP':None}]
             values.append(row)
         for row in values:
-            self.page.store.append(row)
+            self.page.store.append(row + [None])
         for column in range(4):
             expected=sorted(values,key=lambda row:log_sort_key(row,column))
             self.page.store.set_sort_column_id(column,Gtk.SortType.ASCENDING)

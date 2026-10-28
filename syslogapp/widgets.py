@@ -3,6 +3,19 @@
 from gi.repository import Gtk, Gdk, GLib, Pango
 
 
+def set_cell_style(cell, foreground, weight):
+    """Avoid invalidating Pango layouts when a reused cell's style is unchanged."""
+    style = (foreground, int(weight))
+    if getattr(cell, '_terminal_style', None) != style:
+        cell.set_property('foreground', foreground)
+        cell.set_property('weight', weight)
+        cell._terminal_style = style
+
+
+def _empty_compare(*_args):
+    return 0
+
+
 class TableTextAccess:
     """Character selection across native table cells; never replaces readouts."""
     def __init__(self, tree, columns, extra_actions=(), connect=True, on_select=None,
@@ -15,13 +28,16 @@ class TableTextAccess:
         self._pointer = None
         self._scroll_source = 0
         self._full_attrs = self._attributes(0, 0xffffffff)
+        self._subscriptions = []
+        self._disposed = False
         for column, index in columns.items():
             for renderer in column.get_cells():
                 if isinstance(renderer, Gtk.CellRendererText):
                     renderer.set_property('editable', False)
                     column.set_cell_data_func(renderer, self._paint_cell, index)
-            column.connect('notify::visible', lambda *_: self.clear_selection())
-        tree.get_model().connect('sort-column-changed', lambda *_: self.clear_selection())
+            self._subscriptions.append((column, column.connect('notify::visible', lambda *_: self.clear_selection())))
+        model = tree.get_model()
+        self._subscriptions.append((model, model.connect('sort-column-changed', lambda *_: self.clear_selection())))
         if connect:
             tree.connect('button-press-event', self.button_press)
         tree.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
@@ -29,8 +45,6 @@ class TableTextAccess:
         tree.connect('button-release-event', self._release)
         tree.connect('key-press-event', self._key)
         tree.connect('destroy', self._destroy)
-        if not tree.get_has_tooltip():
-            tree.set_tooltip_text('Drag across text and rows to select; Ctrl+C copies; Ctrl+A selects all shown text.')
 
     @staticmethod
     def _attributes(start, end):
@@ -75,7 +89,8 @@ class TableTextAccess:
     def _paint_cell(self, column, renderer, model, itr, index):
         if self.cell_data:
             self.cell_data(column, renderer, model, itr, index)
-        renderer.set_property('attributes', None)
+        if renderer.get_property('attributes') is not None:
+            renderer.set_property('attributes', None)
         bounds = self._bounds()
         if not bounds:
             return
@@ -209,6 +224,16 @@ class TableTextAccess:
         self._pressed = False
         return True
 
+    def selected_row_indices(self):
+        """Whole entries touched by a character selection, or the selected row."""
+        bounds = self._bounds()
+        if bounds:
+            first, last = bounds
+            end = last[0] - (1 if last[1:] == (0, 0) else 0)
+            return list(range(first[0], end + 1))
+        model, itr = self.tree.get_selection().get_selected()
+        return [model.get_path(itr).get_indices()[0]] if itr is not None else []
+
     def selected_text(self):
         bounds = self._bounds()
         if not bounds:
@@ -263,7 +288,28 @@ class TableTextAccess:
         Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(value, -1)
 
     def _destroy(self, *_):
+        if self._disposed:
+            return
+        self._disposed = True
         self._stop_scroll()
+        for owner, handler in self._subscriptions:
+            owner.disconnect(handler)
+        self._subscriptions.clear()
+        self.extra_actions = ()
+        self.on_select = self.cell_data = self.format_value = None
+        self._anchor = self._end = None
+        # Native GTK retains these Python callbacks beyond widget destruction.
+        # Remove references back to a page so host switching can collect it.
+        model = self.tree.get_model()
+        if model is not None:
+            _column, order = model.get_sort_column_id()
+            model.set_sort_column_id(Gtk.TREE_SORTABLE_UNSORTED_SORT_COLUMN_ID, order if order is not None else Gtk.SortType.ASCENDING)
+        for column in self.tree.get_columns():
+            sort_id = column.get_sort_column_id()
+            if model is not None and sort_id >= 0:
+                model.set_sort_func(sort_id, _empty_compare)
+            for renderer in column.get_cells():
+                column.set_cell_data_func(renderer, None)
 
     def button_press(self, tree, event):
         if event.button not in (1, 3):
@@ -356,7 +402,6 @@ class CommandBar(Gtk.Box):
 
 def action_menu(actions):
     button = Gtk.MenuButton(label='⋯')
-    button.set_tooltip_text('More actions')
     button.get_accessible().set_name('More actions')
     menu = Gtk.Menu()
     for label, callback in actions:
@@ -370,6 +415,7 @@ def action_menu(actions):
 
 class ColumnSizing:
     """Automatic fit until a header is dragged; manual widths survive re-layout."""
+    RESIZE_DELAY_MS = 120
     def __init__(self, columns, renderers, changed, saved=None):
         self.columns = columns
         self.renderers = renderers
@@ -380,10 +426,11 @@ class ColumnSizing:
         self._pending_widths = None
         self._last_requested = None
         self._automatic_ready = False
+        self._width_handlers = []
         for index, column in enumerate(columns):
             column.set_resizable(True)
             column.set_max_width(-1)
-            column.connect('notify::fixed-width', self._user_width, index)
+            self._width_handlers.append((column, column.connect('notify::fixed-width', self._user_width, index)))
         self.restore(saved or {})
 
     def restore(self, saved):
@@ -421,14 +468,24 @@ class ColumnSizing:
         self._last_requested = None
         width = max(column.get_min_width(), column.get_fixed_width())
         self.manual[index] = width
-        self._wrap(index, width)
-        self.changed()
+        # Save the width immediately, but defer expensive wrapped-row layout
+        # while the user drags a column divider.
+        self._automatic_ready = True
+        self._pending_widths = tuple(col.get_fixed_width() for col in self.columns)
+        self._resize_source = GLib.timeout_add(self.RESIZE_DELAY_MS, self._finish_resize)
 
     def cancel_pending(self):
         if self._resize_source:
             GLib.source_remove(self._resize_source)
             self._resize_source = 0
         self._pending_widths = None
+
+    def dispose(self):
+        self.cancel_pending()
+        for column, handler in self._width_handlers:
+            column.disconnect(handler)
+        self._width_handlers.clear()
+        self.changed = lambda: None
 
     def apply_deferred(self, widths):
         # Keep vertical allocations cheap and collapse horizontal drag events.
@@ -442,7 +499,7 @@ class ColumnSizing:
             self.apply(widths)
             return
         self._pending_widths = widths
-        self._resize_source = GLib.timeout_add(60, self._finish_resize)
+        self._resize_source = GLib.timeout_add(self.RESIZE_DELAY_MS, self._finish_resize)
 
     def _finish_resize(self):
         self._resize_source = 0

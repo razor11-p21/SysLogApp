@@ -3,11 +3,16 @@
 TERMINAL = r"""
 window, .app-root { background: #101411; color: #c6d4c9; font-family: monospace; font-size: 13px; }
 * { transition: none; animation: none; box-shadow: none; text-shadow: none; }
+/* Only log previews use this theme; other hover hints remain absent. */
+window.log-hover { background: #171e19; color: #c6d4c9; border: 1px solid #526b59; border-radius: 0; }
+.log-hover label { background: transparent; color: #c6d4c9; font-family: monospace; font-size: 12px; }
+spinbutton { background: #171e19; color: #c6d4c9; border-radius: 0; }
 .host-sidebar { border-right: 1px solid #36483b; }
 .host-sidebar list, .host-sidebar row { background: #101411; color: #c6d4c9; }
 .host-sidebar row:selected { background: #294432; color: #91d89d; }
 .terminal-title { color: #91d89d; font-size: 14px; font-weight: bold; }
 .muted, .status-line { color: #96a79a; }
+.stale-data { color: #ffb34c; }
 .status-line { padding: 6px 12px; border-top: 1px solid #2b3930; font-size: 11px; }
 .toolbar-card { border-top: 1px solid #2b3930; border-bottom: 1px solid #2b3930; padding: 2px; }
 button, entry, combobox button { background: #171e19; color: #c6d4c9; border: 1px solid #36483b; border-radius: 0; min-height: 22px; padding: 2px 6px; }

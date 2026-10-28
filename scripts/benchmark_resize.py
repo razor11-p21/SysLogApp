@@ -7,10 +7,15 @@ Run: /usr/bin/python3 scripts/benchmark_resize.py [source-directory] [--profile]
 Uses an offscreen window with 1,000 synthetic wrapped journal records. CPU time
 and resize-step gaps do not measure compositor performance or pointer latency.
 """
-import sys,time,json,cProfile,pstats
+import sys,time,json,cProfile,pstats,argparse
 from pathlib import Path
 from types import SimpleNamespace
-sys.path.insert(0,sys.argv[1] if len(sys.argv)>1 and not sys.argv[1].startswith('--') else str(Path(__file__).resolve().parents[1]))
+parser=argparse.ArgumentParser()
+parser.add_argument('source',nargs='?',default=str(Path(__file__).resolve().parents[1]))
+parser.add_argument('--profile',action='store_true')
+parser.add_argument('--step-ms',type=int,default=16,choices=range(1,251),metavar='1..250')
+args=parser.parse_args()
+sys.path.insert(0,args.source)
 import gi
 gi.require_version('Gtk','3.0')
 from gi.repository import Gtk,GLib
@@ -23,14 +28,14 @@ w=Gtk.OffscreenWindow();w.set_size_request(1100,650);w.add(p);w.show_all()
 loop=GLib.MainLoop();GLib.timeout_add(400,lambda:(loop.quit(),False)[1]);loop.run()
 widths=list(range(1100,699,-20))+list(range(700,1101,20));gaps=[];last=time.monotonic();start=last;cpu=time.process_time();index=0
 profile=cProfile.Profile()
-if '--profile' in sys.argv:profile.enable()
+if args.profile:profile.enable()
 def step():
  global index,last
  now=time.monotonic();gaps.append((now-last)*1000);last=now
  if index>=len(widths):
   GLib.timeout_add(350,lambda:(loop.quit(),False)[1]);return False
  w.set_size_request(widths[index],650);w.resize(widths[index],650);index+=1;return True
-GLib.timeout_add(16,step);loop.run()
-if '--profile' in sys.argv:profile.disable();pstats.Stats(profile).sort_stats('cumtime').print_stats(12)
+GLib.timeout_add(args.step_ms,step);loop.run()
+if args.profile:profile.disable();pstats.Stats(profile).sort_stats('cumtime').print_stats(12)
 print(json.dumps({'resize_cpu_ms':round((time.process_time()-cpu)*1000,1),'wall_ms':round((time.monotonic()-start)*1000,1),'slowest_step_ms':round(max(gaps),1),'steps':len(widths)}))
 w.destroy()

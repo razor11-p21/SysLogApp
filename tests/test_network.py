@@ -119,6 +119,83 @@ class NetworkUITests(unittest.TestCase):
         self.page.destroy()
         self.page._loaded(self.result, None)
 
+    def test_partial_socket_failure_preserves_rows_selection_and_success_time(self):
+        self.page._loaded(self.result, None)
+        self.page.tree.get_selection().select_path(0)
+        selected = self.page._selected_key()
+        reference = Gtk.TreeRowReference.new(self.page.store, Gtk.TreePath.new_from_indices([0]))
+        changes = []
+        self.page.store.connect('row-deleted', lambda *_: changes.append('deleted'))
+        self.page.store.connect('row-inserted', lambda *_: changes.append('inserted'))
+        self.page._loaded(dict(self.result, time='12:00:02', sockets=None,
+                               errors=['Sockets: Not permitted']), None)
+        self.assertEqual(len(self.page.store), 2)
+        self.assertTrue(reference.valid())
+        self.assertEqual(self.page._selected_key(), selected)
+        self.assertEqual(changes, [])
+        status = self.page.status.get_text()
+        self.assertIn('Stale connections', status)
+        self.assertIn('last successful update 12:00:00', status)
+        self.assertIn('Not permitted', status)
+        self.assertTrue(self.page.status.get_style_context().has_class('stale-data'))
+        self.page._loaded(None, RuntimeError('SSH connection lost'))
+        self.assertIn('last successful update 12:00:00', self.page.status.get_text())
+
+    def test_failed_first_read_is_unavailable_instead_of_empty_or_stale(self):
+        self.page._loaded(dict(self.result, sockets=None, errors=['Sockets: ss missing']), None)
+        self.assertEqual(len(self.page.store), 0)
+        self.assertIn('Connections unavailable', self.page.status.get_text())
+        self.assertNotIn('Stale connections', self.page.status.get_text())
+        self.assertNotIn('0 loaded', self.page.status.get_text())
+        self.page._loaded(None, RuntimeError('SSH unavailable'))
+        self.assertIn('no successful socket read', self.page.status.get_text())
+        self.assertNotIn('Previous snapshot retained', self.page.status.get_text())
+
+    def test_successful_empty_snapshot_clears_stale_connections_and_warning(self):
+        self.page._loaded(self.result, None)
+        self.page._loaded(dict(self.result, sockets=None, errors=['Sockets: failed']), None)
+        self.page._loaded(dict(self.result, time='12:00:04', sockets=[]), None)
+        self.assertEqual(len(self.page.store), 0)
+        self.assertIn('0 shown / 0 loaded', self.page.status.get_text())
+        self.assertIn('snapshot 12:00:04', self.page.status.get_text())
+        self.assertNotIn('Stale', self.page.status.get_text())
+        self.assertFalse(self.page.status.get_style_context().has_class('stale-data'))
+
+    def test_interface_failure_does_not_mark_successful_sockets_stale(self):
+        self.page._loaded(self.result, None)
+        self.page._loaded(dict(self.result, time='12:00:04', interfaces=None,
+                               errors=['Interfaces: ip missing']), None)
+        self.assertIn('snapshot 12:00:04', self.page.status.get_text())
+        self.assertIn('Interfaces: ip missing', self.page.status.get_text())
+        self.assertNotIn('Stale connections', self.page.status.get_text())
+        self.assertEqual(len(self.page.store), 2)
+
+    def test_failed_process_request_preserves_metadata_of_retained_connections(self):
+        self.page.process_details.set_active_id('basic')
+        self.page._loaded(dict(self.result, processes=False), None)
+        self.page._loaded(dict(self.result, processes=True, sockets=None,
+                               errors=['Sockets: failed']), None)
+        self.assertFalse(self.page.columns[7].get_visible())
+        self.page._loaded(dict(self.result, processes=True), None)
+        self.assertTrue(self.page.columns[7].get_visible())
+        self.page._loaded(dict(self.result, processes=False, sockets=None,
+                               errors=['Sockets: failed']), None)
+        self.assertTrue(self.page.columns[7].get_visible())
+
+    def test_stale_filtering_and_remote_recovery_stay_local_and_keep_correct_timestamp(self):
+        self.page.host = SimpleNamespace(profile={'hostname': 'remote.example'})
+        self.page._loaded(self.result, None)
+        self.page._loaded(dict(self.result, time='12:00:02', sockets=None,
+                               errors=['Sockets: remote read failed']), None)
+        self.page.kind.set_active(1)
+        self.assertEqual(len(self.page.store), 1)
+        self.assertIn('1 shown / 2 loaded', self.page.status.get_text())
+        self.assertIn('last successful update 12:00:00', self.page.status.get_text())
+        self.app.run_async.assert_not_called()
+        self.page._loaded(dict(self.result, time='12:00:06'), None)
+        self.assertNotIn('Stale', self.page.status.get_text())
+        self.assertIn('snapshot 12:00:06', self.page.status.get_text())
+
     def test_wrapped_endpoints_reflow_when_resizing_and_timer_stops(self):
         self.result['sockets'][0]['peer'] = '[2001:db8:1234:1234:1234:1234:1234:1234]:12345'
         self.result['sockets'][0]['local'] = '[2001:db8:5678:5678:5678:5678:5678:5678]:54321'
@@ -129,7 +206,7 @@ class NetworkUITests(unittest.TestCase):
         window.show_all()
         def settle():
             loop = GLib.MainLoop()
-            GLib.timeout_add(180, lambda: (loop.quit(), False)[1])
+            GLib.timeout_add(260, lambda: (loop.quit(), False)[1])
             loop.run()
         settle()
         path = Gtk.TreePath.new_from_indices([0])
@@ -375,7 +452,7 @@ class NetworkUITests(unittest.TestCase):
         window.show_all()
         def settle():
             loop = GLib.MainLoop()
-            GLib.timeout_add(180, lambda:(loop.quit(),False)[1])
+            GLib.timeout_add(260, lambda:(loop.quit(),False)[1])
             loop.run()
         settle()
         self.assertFalse(self.page.columns[6].get_visible())
@@ -537,7 +614,7 @@ class NetworkUITests(unittest.TestCase):
         window.show_all()
         def settle():
             loop = GLib.MainLoop()
-            GLib.timeout_add(180, lambda: (loop.quit(), False)[1])
+            GLib.timeout_add(260, lambda: (loop.quit(), False)[1])
             loop.run()
         try:
             settle()
@@ -552,3 +629,20 @@ class NetworkUITests(unittest.TestCase):
             self.assertNotEqual([column.get_width() for column in self.page.columns], widths)
         finally:
             window.destroy()
+
+    def test_bulk_replacement_preserves_numeric_sort_duplicates_and_selection(self):
+        rows = [dict(self.result['sockets'][0], local=f'127.0.0.1:{10000+i}') for i in range(100)]
+        rows.append(dict(rows[50]))
+        self.page.store.set_sort_column_id(3, Gtk.SortType.DESCENDING)
+        self.page._loaded(dict(self.result, sockets=rows), None)
+        self.assertEqual([int(row[3]) for row in self.page.store],
+                         sorted([10000+i for i in range(100)] + [10050], reverse=True))
+        selected = next(row.iter for row in self.page.store if row[3] == '10050')
+        self.page.tree.get_selection().select_iter(selected)
+        changed = [row if row['local'].endswith(':10050') else dict(row, peer='192.0.2.1:8443') for row in rows]
+        self.page._loaded(dict(self.result, sockets=changed), None)
+        model, itr = self.page.tree.get_selection().get_selected()
+        self.assertIsNotNone(itr)
+        self.assertEqual(model.get_value(itr, 3), '10050')
+        self.assertEqual(len(self.page.store), 101)
+        self.assertEqual(self.page.store.get_sort_column_id(), (3, Gtk.SortType.DESCENDING))

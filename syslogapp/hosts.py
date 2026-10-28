@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import weakref
+import selectors
 
 TOOLS = ('journalctl', 'ip', 'ss', 'python3', 'sudo', 'apt-get',
          'systemctl', 'dpkg', 'logrotate', 'cat', 'find')
@@ -39,7 +40,7 @@ def host_profile(data):
         raise ValueError('Enter a valid SSH username.')
     try:
         port = int(data.get('port', 22))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError('SSH port must be between 1 and 65535')
     if not 1 <= port <= 65535:
         raise ValueError('SSH port must be between 1 and 65535')
@@ -69,6 +70,12 @@ class SSHHost:
         self.control = str(Path(self._directory.name) / 's')
         self.known_hosts = known_hosts
         self.connected = False
+        self.state = 'disconnected'
+        self.state_handler = None
+        self.credential_warning = None
+        self._state_lock = threading.Lock()
+        self._health_lock = threading.Lock()
+        self._watch_stop = None
         self._closed = False
         self._lock = threading.Lock()
         self._children = weakref.WeakSet()
@@ -94,6 +101,7 @@ class SSHHost:
         return args
 
     def connect(self):
+        self._set_state('connecting')
         if not shutil.which('ssh'):
             raise RuntimeError('Install the OpenSSH client to connect to remote hosts.')
         args = self._options() + ['-M', '-N', '-f', '-o', 'ControlPersist=no',
@@ -113,6 +121,14 @@ class SSHHost:
                            SYSLOGAPP_SSH_AUTH=self.profile['auth'],
                            SYSLOGAPP_SSH_ACCOUNT=json.dumps({key: self.profile[key] for key in ('hostname', 'username', 'port')}),
                            SYSLOGAPP_SSH_ATTEMPT=str(Path(self._directory.name) / 'password-attempt'))
+        pending = None
+        if self.profile['auth'] == 'password':
+            from .pending_password import PendingPassword
+            try:
+                pending = PendingPassword(self._directory.name)
+                environment['SYSLOGAPP_SSH_PENDING'] = str(pending.path)
+            except OSError:
+                self.credential_warning = 'Password saving is unavailable for this connection.'
         try:
             # A background SSH master retains its descriptors. Use a file for
             # diagnostics instead of pipes that would never reach EOF after -f.
@@ -130,11 +146,27 @@ class SSHHost:
                 raise RuntimeError('Connection cancelled')
             self.connected = True
             self._probe()
+            self._set_state('connected')
+            self._watch_master()
+            if not self.connected:
+                raise RuntimeError('SSH connection was lost while connecting')
+            if pending:
+                secret = pending.take()
+                if secret is not None:
+                    try:
+                        from .credentials import PasswordStore
+                        PasswordStore(self.profile).save(secret)
+                    except Exception:
+                        self.credential_warning = 'Connected, but the password could not be saved in the desktop keyring.'
+                    finally:
+                        secret = None
             return self
         except Exception:
             self.close()
             raise
         finally:
+            if pending:
+                pending.close()
             self._connect_proc = None
 
     def _spawn(self, command, **kwargs):
@@ -159,10 +191,77 @@ class SSHHost:
         kwargs.setdefault('stdin', subprocess.DEVNULL)
         return self._spawn(self.command(args, tty=True), **kwargs)
 
-    def capture(self, args, timeout=5, max_bytes=512 * 1024):
+    def capture(self, args, timeout=5, max_bytes=512 * 1024, return_stderr=False):
         from .network import capture
-        return capture(self.command(args), timeout=timeout, max_bytes=max_bytes,
-                       popen_factory=self._spawn)
+        try:
+            return capture(self.command(args), timeout=timeout, max_bytes=max_bytes,
+                           popen_factory=self._spawn, return_stderr=return_stderr)
+        except Exception:
+            self.check_transport()
+            raise
+
+    def _set_state(self, state, reason=''):
+        with self._state_lock:
+            if self._closed and state != 'disconnected':
+                return
+            self.connected = state == 'connected'
+            if self.state == state:
+                return
+            self.state = state
+            callback = self.state_handler
+        if callback:
+            callback(self, state, reason)
+
+    def _control_check(self):
+        from .network import capture
+        _out, limited, diagnostic = capture(self._options() + ['-O', 'check', '--', self.profile['hostname']],
+                                           timeout=2, max_bytes=4096, return_stderr=True)
+        if limited:
+            raise RuntimeError('SSH control check exceeded its output limit')
+        return diagnostic
+
+    def check_transport(self):
+        # Only failed reads request a control check. Successful monitoring adds
+        # no probes. Never confuse an ordinary command failure with SSH loss.
+        if self._closed or not self.connected or not self._health_lock.acquire(False):
+            return
+        try:
+            self._control_check()
+        except Exception:
+            self._set_state('disconnected', 'SSH transport is unavailable')
+        finally:
+            self._health_lock.release()
+
+    def _watch_master(self):
+        diagnostic = self._control_check()
+        match = re.search(r'Master running \(pid=(\d+)\)', diagnostic)
+        if not match or not hasattr(os, 'pidfd_open'):
+            return  # Older kernels still detect loss on the next failed read.
+        try:
+            descriptor = os.pidfd_open(int(match[1]))
+        except OSError:
+            return
+        try:
+            reader, writer = os.pipe()
+        except OSError:
+            os.close(descriptor)
+            return  # Failed-read transport checks remain available.
+        self._watch_stop = writer
+        def wait():
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(descriptor, selectors.EVENT_READ, 'master')
+                    selector.register(reader, selectors.EVENT_READ, 'stop')
+                    events = selector.select()
+                    if any(key.data == 'master' for key, _ in events) and not self._closed:
+                        self._set_state('disconnected', 'SSH connection lost')
+            finally:
+                os.close(descriptor)
+                os.close(reader)
+                with self._state_lock:
+                    self._watch_stop = None
+                    os.close(writer)
+        threading.Thread(target=wait, name='ssh-master-exit', daemon=True).start()
 
     def _probe(self):
         script = 'for tool in ' + ' '.join(dict.fromkeys(TOOLS)) + '; do printf "%s=" "$tool"; command -v "$tool" || true; done; printf "uid="; id -u'
@@ -199,12 +298,12 @@ class SSHHost:
     def python_ready(self):
         return bool(self.which('python3') and self.python_version and self.python_version >= (3, 8))
 
-    def overview(self):
+    def overview(self, include_remote=False):
         if not self.python_ready:
             raise RuntimeError('Overview requires Python 3.8 or newer on the remote host.')
         source = Path(__file__).with_name('overview.py').read_text()
-        text, limited = self.capture([self.which('python3'), '-c', source + '\nimport json; print(json.dumps(snapshot()))'],
-                                     timeout=10, max_bytes=64 * 1024)
+        text, limited = self.capture([self.which('python3'), '-c', source + f'\nimport json; print(json.dumps(snapshot(include_remote={bool(include_remote)!r}), ensure_ascii=False))'],
+                                     timeout=10, max_bytes=256 * 1024)
         if limited:
             raise RuntimeError('Remote overview exceeded its output limit')
         result = json.loads(text)
@@ -271,13 +370,19 @@ class SSHHost:
                         os.killpg(proc.pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
+        with self._state_lock:
+            if self._watch_stop is not None:
+                try:
+                    os.write(self._watch_stop, b'x')
+                except OSError:
+                    pass
         if self.connected or Path(self.control).exists():
             try:
                 subprocess.run(self._options() + ['-O', 'exit', '--', self.profile['hostname']],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        self.connected = False
+        self._set_state('disconnected', 'SSH session closed')
         self._directory.cleanup()
 
 
@@ -287,6 +392,7 @@ class HostContext:
         self.application = application
         self.host = host
         self.active = True
+        self.generation = 0
 
     @property
     def config(self):
@@ -301,8 +407,15 @@ class HostContext:
         return not self.active or self.application._closing
 
     def run_async(self, function, callback):
+        generation = self.generation
         def finished(result, error):
-            if not self._closing:
+            if not self._closing and generation == self.generation:
                 return callback(result, error)
             return False
-        self.application.run_async(function, finished)
+        def scoped():
+            if self._closing or generation != self.generation:
+                raise RuntimeError('Obsolete host read cancelled')
+            if self.host and not getattr(self.host, 'connected', True):
+                raise RuntimeError('SSH disconnected; reconnect before reading current data.')
+            return function()
+        self.application.run_async(scoped, finished)

@@ -29,6 +29,13 @@ class HostTests(unittest.TestCase):
         self.assertEqual(len(saved['hosts']),1)
         self.assertNotIn('secret',json.dumps(saved))
 
+    def test_nonfinite_saved_ports_are_rejected_without_breaking_settings(self):
+        for port in (float('inf'), float('-inf'), float('nan')):
+            with self.assertRaises(ValueError):
+                host_profile(dict(PROFILE, port=port))
+            settings = config.normalized({'hosts': [dict(PROFILE, port=port), PROFILE]})
+            self.assertEqual(len(settings['hosts']), 1)
+
     def test_command_quotes_remote_arguments_and_cannot_reconnect_implicitly(self):
         host=self.host()
         host.connected=True
@@ -81,7 +88,7 @@ class HostTests(unittest.TestCase):
         def capture(args,**kwargs):
             if args[0]=='ip':return '[]',False
             if args[0]=='ss':return 'tcp ESTAB 0 0 10.0.0.1:1 192.0.2.1:2\n',False
-            if args[0]=='journalctl':return json.dumps({'MESSAGE':'remote marker','PRIORITY':'6'}),False
+            if args[0]=='journalctl':return json.dumps({'MESSAGE':'remote marker','PRIORITY':'6'}),False,''
             raise AssertionError(args)
         remote=SimpleNamespace(capture=Mock(side_effect=capture))
         with patch.object(network,'capture',side_effect=AssertionError('local scan')), \
@@ -133,7 +140,7 @@ class HostTests(unittest.TestCase):
         self.addCleanup(host.close)
         process=Mock()
         process.wait.return_value=0
-        with patch.object(host,'_spawn',return_value=process) as spawn,patch.object(host,'_probe'):
+        with patch.object(host,'_spawn',return_value=process) as spawn,patch.object(host,'_probe'), patch.object(host, '_watch_master'):
             host.connect()
         command=spawn.call_args.args[0]
         environment=spawn.call_args.kwargs['env']

@@ -25,6 +25,11 @@ def password_store(prompt):
         from .credentials import PasswordStore, CredentialError
     else:
         from credentials import PasswordStore, CredentialError
+    if __package__:
+        from .pending_password import send
+    else:
+        from pending_password import send
+    send()  # Invalidate any earlier attempt before a retry or cancellation.
     try:
         account = json.loads(os.environ['SYSLOGAPP_SSH_ACCOUNT'])
         marker = Path(os.environ['SYSLOGAPP_SSH_ATTEMPT'])
@@ -82,6 +87,7 @@ def main():
     box.add(label)
     entry = Gtk.Entry()
     entry.set_visibility(False)
+    entry.set_max_length(4096)
     entry.set_input_purpose(Gtk.InputPurpose.PASSWORD)
     entry.set_activates_default(True)
     box.add(entry)
@@ -107,9 +113,14 @@ def main():
         value = entry.get_text()
         if remember is not None and remember.get_active():
             try:
-                store.save(value)
+                if __package__:
+                    from .pending_password import send
+                else:
+                    from pending_password import send
+                if not send(value):
+                    raise RuntimeError('Private password handoff unavailable')
             except Exception:
-                note.set_text('Could not save the password. Unlock your desktop keyring and retry, or uncheck Remember password to connect without saving.')
+                note.set_text('Could not prepare password saving. Retry, or uncheck Remember password to connect without saving.')
                 continue
         secret = value
         break

@@ -108,7 +108,7 @@ def network_sort_key(values, column):
 
 
 def log_sort_key(values, column):
-    when, unit, level, message, priority, raw = values
+    when, unit, level, message, priority, raw = values[:6]
     timestamp = timestamp_key(str(raw.get('__REALTIME_TIMESTAMP', when))) if isinstance(raw, dict) else timestamp_key(when)
     primary = (timestamp, natural_key(unit), int(priority), natural_key(message))[column]
     return primary, timestamp, natural_key(unit), natural_key(message)

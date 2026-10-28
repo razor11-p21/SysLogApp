@@ -2,11 +2,13 @@
 # Copyright (C) 2026 pit pitopoulos
 from collections import Counter
 import socket
+import time
 
 from gi.repository import Gtk, Gdk, Pango, GLib
-from ..widgets import CommandBar, action_menu, ColumnSizing, TableTextAccess, selectable_readouts
+from ..widgets import WrappingToolbar, set_cell_style, CommandBar, action_menu, ColumnSizing, TableTextAccess, selectable_readouts
 from ..config import column_widths
 from ..network import snapshot, host_lan_ip
+from ..network_filters import ConnectionFilter
 from ..sorting import network_field_key, network_display_row, compare
 
 
@@ -25,7 +27,9 @@ STATE_TEXT_COLORS = {'ESTAB': '#c6d4c9', 'LISTEN': '#c2afff',
 
 
 class NetworkPage(Gtk.Box):
+    SAVED_PAGE = 'network'
     LIVE_SECONDS = 2
+    DETAILS_SECONDS = 30
     HEADERS = ('Proto', 'State', 'Local address', 'Local port', 'Remote address', 'Remote port', 'PID', 'Process')
     DISPLAY_ORDER = (0, 1, 2, 3, 4, 5, 7, 6)
     SORT_FIELDS = {column: (column,) + tuple(index for index in (1, 0, 2, 3, 4, 5, 6, 7)
@@ -42,11 +46,16 @@ class NetworkPage(Gtk.Box):
         self._column_chars = [max(map(len, header.split())) for header in self.HEADERS]
         self._display_signature = ()
         self._snapshot = None
+        self._details_updated = 0
         self._reflow_source = 0
         self._live_source = 0
         self._generation = 0
         self._failures = 0
         self._last_error = None
+        self._socket_success_time = None
+        self._socket_error = None
+        self._socket_processes = False
+        self._socket_limited = False
         self._layout_key = None
         self._has_fitted_snapshot = False
         self.command_bar = CommandBar()
@@ -56,7 +65,6 @@ class NetworkPage(Gtk.Box):
         self.live.get_style_context().add_class('active-live')
         self.live.set_image(Gtk.Image.new_from_icon_name('media-playback-start-symbolic', Gtk.IconSize.BUTTON))
         self.live.set_always_show_image(True)
-        self.live.set_tooltip_text('Refresh every 2 seconds while Network is visible; starts automatically when opened')
         self.live.connect('toggled', self._on_live)
         toolbar.add(self.live)
         self.search = Gtk.SearchEntry()
@@ -72,7 +80,6 @@ class NetworkPage(Gtk.Box):
         self.kind.connect('changed', lambda *_: self._filter())
         toolbar.add(self.kind)
         self.hide_time_wait = Gtk.CheckButton(label='Hide TIME-WAIT')
-        self.hide_time_wait.set_tooltip_text('Hide closed TCP sockets waiting to expire; filters loaded rows without another scan')
         self.hide_time_wait.connect('toggled', lambda *_: self._filter())
         toolbar.add(self.hide_time_wait)
         # Keep the selected host identity at the right edge of the Live row.
@@ -82,7 +89,6 @@ class NetworkPage(Gtk.Box):
         self.host_name_label.set_markup(f'<span foreground="{PURPLE}" weight="bold">{GLib.markup_escape_text(hostname)}</span>')
         self.host_name_label.set_max_width_chars(26)
         self.host_name_label.set_ellipsize(Pango.EllipsizeMode.END)
-        self.host_name_label.set_tooltip_text(hostname)
         self.host_ip_label = Gtk.Label(label='IP: waiting for snapshot', xalign=1)
         self.host_ip_label.set_max_width_chars(26)
         self.host_ip_label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -100,21 +106,63 @@ class NetworkPage(Gtk.Box):
         for key, label in (('off', 'Process details: Off'), ('basic', 'Process details: Basic'), ('extended', 'Process details: Extended')):
             self.process_details.append(key, label)
         self.process_details.set_active_id('basic')
-        self.process_details.set_tooltip_text('Basic/Extended collect process information on the next refresh. Extended shows full loaded metadata.')
         self.process_details.connect('changed', self._process_changed)
         self.command_bar.secondary.pack_start(self.process_details, False, False, 0)
         self.refresh_btn = Gtk.Button.new_from_icon_name('view-refresh-symbolic', Gtk.IconSize.BUTTON)
-        self.refresh_btn.set_tooltip_text('Refresh network snapshot (F5)')
         self.refresh_btn.connect('clicked', self._refresh_clicked)
         self.command_bar.secondary.pack_start(self.refresh_btn, False, False, 0)
         self.copy = Gtk.MenuItem(label='Copy selected socket')
         self.copy.set_sensitive(False)
         self.copy.connect('activate', self._copy)
-        self.more_actions = action_menu([('Fit columns', self._fit_columns)])
+        self.more_actions = action_menu([('Process details…', self._inspect_selected), ('Related service logs…', self._related_logs), ('Save view…', self._save_view), ('Saved views & bookmarks…', self._saved_items), ('Export connections…', self._export), ('Fit columns', self._fit_columns)])
         self.more_actions.get_popup().prepend(self.copy)
         self.copy.show()
         self.command_bar.secondary.pack_start(self.more_actions, False, False, 0)
         self.pack_start(self.command_bar, False, False, 0)
+        self.connection_filters = Gtk.Expander(label='Connection filters')
+        filter_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        filter_bar = WrappingToolbar()
+        self.application_filter = Gtk.SearchEntry()
+        self.application_filter.set_placeholder_text('Application name')
+        self.application_filter.set_max_length(128)
+        self.application_filter.set_width_chars(12)
+        self.application_filter.connect('search-changed', lambda *_: self._filter())
+        self.pid_filter = Gtk.Entry()
+        self.pid_filter.set_placeholder_text('PID (exact)')
+        self.pid_filter.set_width_chars(8)
+        self.pid_filter.set_max_length(10)
+        self.port_filter = Gtk.Entry()
+        self.port_filter.set_placeholder_text('Port (exact)')
+        self.port_filter.set_width_chars(7)
+        self.port_filter.set_max_length(5)
+        for entry in (self.pid_filter, self.port_filter):
+            entry.set_input_purpose(Gtk.InputPurpose.DIGITS)
+            entry.connect('changed', lambda *_: self._filter())
+        self.port_side = Gtk.ComboBoxText()
+        for key, label in (('either', 'Either port'), ('local', 'Local port'), ('remote', 'Remote port')):
+            self.port_side.append(key, label)
+        self.port_side.set_active_id('either')
+        self.port_side.connect('changed', lambda *_: self._filter())
+        clear_filters = Gtk.Button(label='Clear fields')
+        clear_filters.connect('clicked', self._clear_connection_filters)
+        for title, entry in (('App', self.application_filter), ('PID', self.pid_filter), ('Port', self.port_filter)):
+            group = Gtk.Box(spacing=4)
+            label = Gtk.Label(label=title)
+            group.pack_start(label, False, False, 0)
+            group.pack_start(entry, True, True, 0)
+            entry.get_accessible().set_name(title + ' connection filter')
+            filter_bar.add(group)
+        for control in (self.port_side, clear_filters):
+            filter_bar.add(control)
+        filter_box.pack_start(filter_bar, False, False, 0)
+        self.filter_notice = Gtk.Label(label='Filters apply to loaded connections; no additional scan.', xalign=0)
+        self.filter_notice.set_line_wrap(True)
+        self.filter_notice.set_max_width_chars(1)
+        self.filter_notice.set_selectable(True)
+        self.filter_notice.get_style_context().add_class('muted')
+        filter_box.pack_start(self.filter_notice, False, False, 0)
+        self.connection_filters.add(filter_box)
+        self.pack_start(self.connection_filters, False, False, 0)
         # Interface overview is selectable, wrapped text in a bounded-height viewport.
         self.overview = Gtk.Label(label='Open Network to load a snapshot.', xalign=0, yalign=0)
         self.overview.set_selectable(True)
@@ -133,10 +181,11 @@ class NetworkPage(Gtk.Box):
             self.store.set_sort_func(column, self._compare_rows, column)
         self.store.set_sort_column_id(1, Gtk.SortType.ASCENDING)
         self.tree = Gtk.TreeView(model=self.store)
+        # Column widths settle separately; only newly exposed areas need to
+        # repaint during viewport resizing. Content changes still invalidate rows.
+        self.tree.set_redraw_on_allocate(False)
         self.tree.set_enable_search(False)
         self.tree.get_style_context().add_class('network-table')
-        self.tree.set_has_tooltip(True)
-        self.tree.connect('query-tooltip', self._query_tooltip)
         self.tree.set_fixed_height_mode(False)
         self.tree.get_selection().connect('changed', self._selected)
         self.columns = []
@@ -162,7 +211,6 @@ class NetworkPage(Gtk.Box):
             col.set_cell_data_func(renderer, self._state_cell, i)
             self.tree.append_column(col)
             col.set_visible(i < 6)
-            col.get_button().set_tooltip_text(label + ' — click to sort; drag divider to resize')
             self.columns.append(col)
             self.renderers.append(renderer)
         previous = None
@@ -180,16 +228,28 @@ class NetworkPage(Gtk.Box):
                                           column_widths(getattr(app, 'config', {}), 'network'))
         scroll = Gtk.ScrolledWindow()
         self.socket_scroll = scroll
+        scroll.set_overlay_scrolling(False)
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scroll.connect('size-allocate', self._resize)
         scroll.add(self.tree)
         self.pack_start(scroll, True, True, 0)
+        selected_actions = Gtk.Box(spacing=6)
+        self.inspect_btn = Gtk.Button(label='Process details…')
+        self.logs_btn = Gtk.Button(label='Related logs…')
+        self.inspect_btn.set_sensitive(False)
+        self.logs_btn.set_sensitive(False)
+        self.inspect_btn.connect('clicked', self._inspect_selected)
+        self.logs_btn.connect('clicked', self._related_logs)
+        selected_actions.pack_start(self.inspect_btn, False, False, 0)
+        selected_actions.pack_start(self.logs_btn, False, False, 0)
+        self.pack_start(selected_actions, False, False, 0)
         self.status = Gtk.Label(label='Not loaded', xalign=0)
         self.status.get_style_context().add_class('muted')
         self.status.set_line_wrap(True)
         self.pack_end(self.status, False, False, 0)
         self.text_access = TableTextAccess(
             self.tree, {self.columns[i]: i for i in self.DISPLAY_ORDER},
+            [('Process details…', self._inspect_selected), ('Related service logs…', self._related_logs)],
             on_select=self._hold_for_selection, cell_data=self._state_cell)
         self.socket_scroll.set_margin_bottom(12)
         selectable_readouts(self)
@@ -226,7 +286,8 @@ class NetworkPage(Gtk.Box):
 
     def _on_destroy(self, *_):
         self._destroyed = True
-        self.column_sizing.cancel_pending()
+        self.text_access._destroy()
+        self.column_sizing.dispose()
         self.stop_live()
         if self._reflow_source:
             GLib.source_remove(self._reflow_source)
@@ -260,7 +321,7 @@ class NetworkPage(Gtk.Box):
             self._resize(self.socket_scroll, self.socket_scroll.get_allocation())
 
     def _process_columns(self):
-        visible = bool(self._snapshot and self._snapshot['processes'] and self.process_details.get_active_id() != 'off')
+        visible = bool(self._socket_processes and self.process_details.get_active_id() != 'off')
         changed = self.columns[7].get_visible() != visible
         if changed:
             self.columns[6].set_visible(visible)
@@ -306,26 +367,8 @@ class NetworkPage(Gtk.Box):
             color = PURPLE if model.get_value(itr, index) != '—' else GRAY
         else:
             color = STATE_COLORS.get(state, GRAY) if index in (0, 1) else STATE_TEXT_COLORS.get(state, GRAY)
-        cell.set_property('foreground', color)
-        cell.set_property('weight', Pango.Weight.SEMIBOLD if index in (1, 6) else Pango.Weight.NORMAL)
+        set_cell_style(cell, color, Pango.Weight.SEMIBOLD if index in (1, 6) else Pango.Weight.NORMAL)
 
-    def _query_tooltip(self, tree, x, y, keyboard, tooltip):
-        if keyboard:
-            model, itr = tree.get_selection().get_selected()
-            if itr is None:
-                return False
-        else:
-            hit = tree.get_path_at_pos(int(x), int(y))
-            if not hit:
-                return False
-            model = tree.get_model()
-            itr = model.get_iter(hit[0])
-        values = tuple(model[itr])
-        text = '\n'.join(f'{self.HEADERS[index]}: {values[index]}' for index in self.DISPLAY_ORDER)
-        if values[8]:
-            text += '\nSocket details: ' + values[8]
-        tooltip.set_text(text)
-        return True
 
     @staticmethod
     def _interface_color(item):
@@ -339,6 +382,82 @@ class NetworkPage(Gtk.Box):
     @staticmethod
     def _colored_line(text, color):
         return f'<span foreground="{color}">{GLib.markup_escape_text(text)}</span>'
+
+    def _export(self, *_):
+        from ..export_ui import open_export
+        open_export(self)
+
+    def _related_logs(self, *_):
+        self._inspect_selected(show_logs=True)
+
+    def _inspect_selected(self, *_, show_logs=False):
+        values = self._selected_key()
+        if not values:
+            self.app.window.toast('Select a connection first', 'info')
+            return
+        from ..process_details import owners
+        if not owners(values):
+            self.app.window.toast('No visible process owner. Choose Basic or Extended and Refresh. Closed connections may have no owner.', 'info')
+            return
+        self._hold_for_selection()
+        from ..process_ui import ProcessDialog
+        dialog = ProcessDialog(self, values, show_logs=show_logs)
+        dialog.show_all()
+        dialog.start()
+        try:
+            dialog.run()
+        finally:
+            dialog.destroy()
+
+    def _save_view(self, *_):
+        from ..saved_ui import ask_name
+        from ..investigations import save_view
+        name = ask_name(self, 'Save view')
+        if name is None:
+            return
+        try:
+            save_view(self.host, name, {'page': 'network', 'kind': self.kind.get_active(),
+                      'search': self.search.get_text(), 'hide_time_wait': self.hide_time_wait.get_active(),
+                      'processes': self.process_details.get_active_id(),
+                      'application': self.application_filter.get_text(), 'pid': self.pid_filter.get_text(),
+                      'port': self.port_filter.get_text(), 'port_side': self.port_side.get_active_id()})
+            self.app.window.toast('Network view saved for this host', 'ok')
+        except (OSError, ValueError) as exc:
+            self.app.window.toast(str(exc), 'error')
+
+    def _saved_items(self, *_):
+        from ..saved_ui import SavedDialog
+        try:
+            dialog = SavedDialog(self)
+        except (OSError, ValueError) as exc:
+            self.app.window.toast(str(exc), 'error')
+            return
+        dialog.show_all()
+        try:
+            dialog.run()
+        finally:
+            dialog.destroy()
+
+    def _apply_saved_view(self, item):
+        from ..investigations import host_identity, view_settings
+        if item.get('host') != host_identity(self.host)[0]:
+            self.app.window.toast('This view belongs to another host', 'info')
+            return
+        values = view_settings(item.get('settings', {}))
+        if values['page'] != 'network':
+            return
+        self.live.set_active(False)
+        self.kind.set_active(values['kind'])
+        self.hide_time_wait.set_active(values['hide_time_wait'])
+        self.search.set_text(values['search'])
+        self.process_details.set_active_id(values['processes'])
+        self.application_filter.set_text(values['application'])
+        self.pid_filter.set_text(values['pid'])
+        self.port_filter.set_text(values['port'])
+        self.port_side.set_active_id(values['port_side'])
+        self.connection_filters.set_expanded(bool(values['application'] or values['pid'] or values['port']))
+        self._filter()
+        self.app.window.toast('View applied · Refresh to update collected process details', 'info')
 
     def _refresh_clicked(self, *_):
         self.refresh()
@@ -356,7 +475,11 @@ class NetworkPage(Gtk.Box):
         # Read GTK values here; the worker never touches GTK widgets.
         processes = self.process_details.get_active_id() != 'off'
         generation = self._generation
-        self.app.run_async(lambda: snapshot(processes, host=self.host) if self.host else snapshot(processes),
+        cached = self._snapshot if automatic and time.monotonic() - self._details_updated < self.DETAILS_SECONDS else None
+        kwargs = {'host': self.host} if self.host else {}
+        if cached is not None:
+            kwargs['cached'] = cached
+        self.app.run_async(lambda: snapshot(processes, **kwargs),
                            lambda result, error: self._loaded(result, error, generation, automatic))
 
     def _loaded(self, result, error, generation=None, automatic=False):
@@ -383,6 +506,8 @@ class NetworkPage(Gtk.Box):
             return False
         self._failures = self._failures + 1 if result['errors'] else 0
         self._snapshot = result
+        if result.get('details_refreshed', True):
+            self._details_updated = time.monotonic()
         preferred = getattr(self.host, 'profile', {}).get('hostname') if self.host else None
         address = host_lan_ip(result['interfaces'], result['routes'], preferred)
         ip_text = 'IP: ' + (address or 'unavailable')
@@ -390,8 +515,20 @@ class NetworkPage(Gtk.Box):
             color = BLUE if address else AMBER
             value = GLib.markup_escape_text(address or 'unavailable')
             self.host_ip_label.set_markup(f'IP: <span foreground="{color}" weight="bold">{value}</span>')
-            self.host_ip_label.set_tooltip_text(ip_text + ' · host interface address from the latest snapshot')
-        self._rows = result['sockets'] or []
+        if result['sockets'] is not None:
+            # Empty is a successful read; None means collection failed. Keep the
+            # previous socket rows and their metadata together on partial failure.
+            self._rows = result['sockets']
+            self._socket_success_time = result['time']
+            self._socket_processes = result['processes']
+            self._socket_limited = result['limited']
+            self._socket_error = None
+            self._remote_stale = False
+            if self.host and hasattr(self.app.window, 'remote_fresh'):
+                self.app.window.remote_fresh('network', self.host)
+        else:
+            self._socket_error = next((message for message in result['errors']
+                                       if message.startswith('Sockets:')), 'Socket data unavailable')
         lines = []
         count = len(result['interfaces']) if result['interfaces'] is not None else 'unavailable'
         title = f'Interfaces & routes ({count})'
@@ -419,6 +556,28 @@ class NetworkPage(Gtk.Box):
         self._schedule_live()
         return False
 
+    def _connection_filter_values(self):
+        return dict(application=self.application_filter.get_text(), pid=self.pid_filter.get_text(),
+                    port=self.port_filter.get_text(), side=self.port_side.get_active_id())
+
+    def _clear_connection_filters(self, *_):
+        self.application_filter.set_text('')
+        self.pid_filter.set_text('')
+        self.port_filter.set_text('')
+        self.port_side.set_active_id('either')
+        self._filter()
+
+    def _update_filter_notice(self, filters):
+        self.connection_filters.set_label('Connection filters' + (f' · {filters.count} active' if filters.count else ''))
+        missing = filters.needs_owners and not self._socket_processes
+        text = filters.error or ('App/PID filters need collected owner data. Choose Basic or Extended and Refresh.' if missing else
+                                'App/PID filters use collected owners; visibility depends on host permissions.' if filters.needs_owners else
+                                'Filters apply to loaded connections; no additional scan.')
+        if self.filter_notice.get_text() != text:
+            self.filter_notice.set_text(text)
+        context = self.filter_notice.get_style_context()
+        (context.add_class if filters.error or missing else context.remove_class)('stale-data')
+
     def _filter(self):
         if self._destroyed:
             return
@@ -426,12 +585,16 @@ class NetworkPage(Gtk.Box):
         kind = self.kind.get_active()
         hide_time_wait = self.hide_time_wait.get_active()
         extended = self.process_details.get_active_id() == 'extended'
+        filters = ConnectionFilter(**self._connection_filter_values())
+        self._update_filter_notice(filters)
         values_to_show = []
         for row in self._rows:
             if hide_time_wait and row['state'] == 'TIME-WAIT':
                 continue
             idle = row['state'] in ('LISTEN', 'UNCONN')
             if (kind == 1 and idle) or (kind == 2 and not idle):
+                continue
+            if not filters.matches(row):
                 continue
             values = network_display_row(row, extended=extended)
             if needle and needle not in ' '.join(values).lower():
@@ -461,16 +624,26 @@ class NetworkPage(Gtk.Box):
                     needed[values] -= 1
                 else:
                     obsolete.append(row.iter)
-            # Add replacements before removing expired rows: the view never
-            # collapses to zero height between two non-empty snapshots.
-            for values in values_to_show:
-                if needed[values]:
-                    itr = self.store.append(values)
-                    needed[values] -= 1
-                    if selected and self._row_identity(values) == self._row_identity(selected):
-                        self.tree.get_selection().select_iter(itr)
-            for itr in obsolete:
-                self.store.remove(itr)
+            # Bulk snapshots sort once after mutation; small changes retain
+            # incremental sorting and stable GTK rows.
+            column, order = self.store.get_sort_column_id()
+            bulk = column is not None and len(obsolete) + sum(needed.values()) > 64
+            if bulk:
+                self.store.set_sort_column_id(Gtk.TREE_SORTABLE_UNSORTED_SORT_COLUMN_ID, order)
+            try:
+                # Add replacements before removing expired rows: the view never
+                # collapses to zero height between two non-empty snapshots.
+                for values in values_to_show:
+                    if needed[values]:
+                        itr = self.store.append(values)
+                        needed[values] -= 1
+                        if selected and self._row_identity(values) == self._row_identity(selected):
+                            self.tree.get_selection().select_iter(itr)
+                for itr in obsolete:
+                    self.store.remove(itr)
+            finally:
+                if bulk:
+                    self.store.set_sort_column_id(column, order)
             adjustment.set_value(scroll)
             self._display_signature = signature
         self._update_status()
@@ -482,22 +655,41 @@ class NetworkPage(Gtk.Box):
             mode = 'LIVE' if self.get_mapped() else 'LIVE · hidden'
         else:
             mode = 'paused'
+        failure = self._last_error or self._socket_error
+        context = self.status.get_style_context()
+        (context.add_class if failure else context.remove_class)('stale-data')
         if self._last_error:
-            self.status.set_text(f"{mode} · Couldn't refresh: {self._last_error}. Previous snapshot retained.")
+            if self._socket_success_time is not None:
+                text = (f"{mode} · Stale connections · last successful update {self._socket_success_time}"
+                        f" · {len(self.store)} shown / {len(self._rows)} loaded"
+                        f" · Couldn't refresh: {self._last_error}. Previous snapshot retained.")
+            else:
+                text = f"{mode} · Connections unavailable · no successful socket read · Couldn't refresh: {self._last_error}"
+            self.status.set_text(text)
             return
         if not self._snapshot:
             self.status.set_text(f"{mode} · no snapshot loaded" if not self._busy else f"{mode} · reading snapshot…")
             return
         snap = self._snapshot
-        text = f"{mode} · {len(self.store)} shown / {len(self._rows)} loaded  ·  snapshot {snap['time']}"
+        if self._socket_error:
+            if self._socket_success_time is not None:
+                text = (f"{mode} · Stale connections · last successful update {self._socket_success_time}"
+                        f" · {len(self.store)} shown / {len(self._rows)} loaded")
+            else:
+                text = f"{mode} · Connections unavailable · no successful socket read"
+        else:
+            text = f"{mode} · {len(self.store)} shown / {len(self._rows)} loaded  ·  snapshot {self._socket_success_time}"
         if self._failures and self.live.get_active():
             text += ' · refresh slowed after collection errors'
-        if snap['limited']:
+        text += ' · interfaces/routes ' + snap.get('details_time', snap['time'])
+        if snap['limited'] or self._socket_limited:
             text += '  ·  snapshot limited'
-        if snap['processes']:
+        if self._socket_processes:
             text += '  ·  process visibility depends on permissions'
         if snap['errors']:
             text += '  ·  ' + ' | '.join(snap['errors'])
+        elif self._socket_error:
+            text += ' · ' + self._socket_error
         self.status.set_text(text)
 
     @staticmethod
@@ -509,7 +701,15 @@ class NetworkPage(Gtk.Box):
         return tuple(model[itr]) if itr is not None else None
 
     def _selected(self, *_):
-        self.copy.set_sensitive(self._selected_key() is not None)
+        if self._destroyed:
+            return
+        values = self._selected_key()
+        self.copy.set_sensitive(values is not None)
+        if hasattr(self, 'inspect_btn'):
+            from ..process_details import owners
+            available = bool(values and owners(values))
+            self.inspect_btn.set_sensitive(available)
+            self.logs_btn.set_sensitive(available)
 
     def _copy(self, *_):
         values = self._selected_key()
@@ -570,7 +770,7 @@ class NetworkPage(Gtk.Box):
             return
         if self._reflow_source:
             GLib.source_remove(self._reflow_source)
-        self._reflow_source = GLib.timeout_add(100, self._reflow)
+        self._reflow_source = GLib.timeout_add(50, self._reflow)
 
     def _reflow(self):
         self._reflow_source = 0

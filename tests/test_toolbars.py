@@ -39,10 +39,10 @@ class ToolbarTests(unittest.TestCase):
         page = LogsPage(self.app())
         try:
             items = page.more_actions.get_popup().get_children()
-            self.assertEqual([item.get_label() for item in items], ['Export logs…', 'Fit columns'])
+            self.assertEqual([item.get_label() for item in items], ['Save view…', 'Saved views & bookmarks…', 'Bookmark selected event…', 'Return to recent logs', 'Export logs…', 'Fit columns'])
             page.tree_columns[1].set_fixed_width(250)
             self.assertTrue(page.column_sizing.manual)
-            items[1].activate()
+            items[-1].activate()
             self.assertFalse(page.column_sizing.manual)
         finally:
             page.destroy()
@@ -66,3 +66,24 @@ class ToolbarTests(unittest.TestCase):
                 self.assertGreater(widths[1], widths[0] + 300)
             finally:
                 window.destroy()
+
+    def test_log_limit_defaults_to_400_and_caps_at_2000(self):
+        app = self.app()
+        page = LogsPage(app)
+        try:
+            self.assertEqual(page.history_limit.get_value_as_int(), 400)
+            with patch.object(page, 'reload') as reload:
+                page.history_limit.set_value(2000)
+                self.assertEqual(page.max_rows, 2000)
+                self.assertEqual(app.config['log_lines'], 2000)
+                self.assertEqual(page._pending_rows.maxlen, 2000)
+                reload.assert_called_once()
+                page.history_limit.set_value(3000)
+                self.assertEqual(page.history_limit.get_value_as_int(), 2000)
+            restored = LogsPage(app)
+            self.assertEqual(restored.max_rows, 2000)
+            restored.destroy()
+            self.assertFalse(page.log_scroll.get_overlay_scrolling())
+        finally:
+            page.destroy()
+

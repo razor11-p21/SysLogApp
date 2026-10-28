@@ -37,7 +37,7 @@ def package(stage, name, version, maintainer, depends, description, destination)
     write(doc / 'copyright', copyright_text)
     shutil.copy2(ROOT / 'NOTICE.md', doc / 'NOTICE.md')
     shutil.copy2(ROOT / 'AUTHORS', doc / 'AUTHORS')
-    changelog = f'{name} ({version}) unstable; urgency=medium\n\n  * Improve live controls, event details, host identity, menu theming and horizontal resize responsiveness.\n\n -- {maintainer}  Sun, 25 Oct 2026 00:00:00 +0300\n'
+    changelog = f'{name} ({version}) unstable; urgency=medium\n\n  * Publish the first public alpha, based on Preview 70.\n  * Include journal, network, SSH, overview and maintenance tools.\n\n -- {maintainer}  Wed, 28 Oct 2026 00:00:00 +0200\n'
     (doc / 'changelog.Debian.gz').write_bytes(gzip.compress(changelog.encode(), mtime=0))
     files = sorted(path for path in stage.rglob('*') if path.is_file())
     installed_size = sum(path.stat().st_size for path in files) // 1024 + 1
@@ -67,7 +67,10 @@ def build(draft=False):
     version = metadata['version']
     if draft:
         version = version.replace('-1', '+draft1-1')
-    destination = ROOT / 'dist' / ('draft' if draft else 'preview48')
+    release_directory = metadata.get('release_directory', 'alpha1')
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', release_directory) or release_directory in ('.', '..'):
+        raise ValueError('Release directory must be a simple directory name')
+    destination = ROOT / 'dist' / ('draft' if draft else release_directory)
     destination.mkdir(parents=True, exist_ok=True)
     maintainer = f"{metadata['author']} <{email}>"
     with tempfile.TemporaryDirectory(prefix='syslogapp-build-') as temporary:
@@ -86,7 +89,7 @@ def build(draft=False):
         shutil.copy2(ROOT / 'syslogapp/assets/syslogapp.svg', icon)
         docs = stage / 'usr/share/doc/syslogapp'
         docs.mkdir(parents=True)
-        for name in ('README.md', 'RELEASE.md', 'PERFORMANCE.md'):
+        for name in ('README.md', 'RELEASE.md', 'PERFORMANCE.md', 'COMPATIBILITY.md'):
             shutil.copy2(ROOT / name, docs / name)
         man = stage / 'usr/share/man/man1/syslogapp.1.gz'
         man.parent.mkdir(parents=True)
@@ -102,7 +105,7 @@ def build(draft=False):
                                f'syslogapp (= {version}), cinnamon',
                                'optional Cinnamon panel launcher for SysLogApp\n Adds an applet available in Cinnamon Applets settings.\n It does not change panel preferences or enable itself automatically.', destination))
     archive = destination / f'SysLogApp-{version}-source.tar.gz'
-    names = ['LICENSE', 'AUTHORS', 'NOTICE.md', 'README.md', 'RELEASE.md', 'PERFORMANCE.md', 'install.sh',
+    names = ['LICENSE', 'AUTHORS', 'NOTICE.md', 'README.md', 'RELEASE.md', 'PERFORMANCE.md', 'COMPATIBILITY.md', 'install.sh',
              'uninstall.sh', 'run-preview.sh', 'syslogapp.py', 'syslogapp', 'cinnamon', 'scripts', 'tests', 'packaging']
     def clean(info):
         return None if '__pycache__' in Path(info.name).parts or info.name.endswith(('.pyc', '.pyo')) else info

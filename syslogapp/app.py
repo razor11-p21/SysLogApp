@@ -29,6 +29,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._maximized = bool(state.get('maximized', False))
         self._fullscreen = False
         self._layout_saved = False
+        self._layout_save_error = None
+        self._skip_layout_save = False
+        self._close_prompt_active = False
         self.set_default_size(width, height)
         if self._maximized:
             self.maximize()
@@ -45,6 +48,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._connect_cancelled = False
         self._host_selection_guard = False
         self._profile_index = None
+        self._remote_stale = set()
         self.pages = {"logs": LogsPage(app)}
         self.notebook = Gtk.Notebook()
         self.notebook.set_scrollable(True)
@@ -71,7 +75,21 @@ class MainWindow(Gtk.ApplicationWindow):
         self.host_label.set_ellipsize(Pango.EllipsizeMode.END)
         self.host_label.get_style_context().add_class('terminal-title')
         host_bar.pack_start(self.host_label, True, True, 0)
+        self.connection_state = Gtk.Label(label='Local', xalign=0)
+        self.connection_state.set_selectable(True)
+        host_bar.pack_start(self.connection_state, False, False, 0)
+        self.reconnect_button = Gtk.Button(label='Reconnect')
+        self.reconnect_button.set_no_show_all(True)
+        self.reconnect_button.connect('clicked', self._connect_clicked)
+        host_bar.pack_start(self.reconnect_button, False, False, 0)
         self.root.pack_start(host_bar, False, False, 0)
+        self.connection_notice = Gtk.Label(xalign=0)
+        self.connection_notice.set_selectable(True)
+        self.connection_notice.set_line_wrap(True)
+        self.connection_notice.set_max_width_chars(1)
+        self.connection_notice.get_style_context().add_class('stale-data')
+        self.connection_notice.set_no_show_all(True)
+        self.root.pack_start(self.connection_notice, False, False, 0)
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self.sidebar_revealer = Gtk.Revealer()
         self.sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.NONE)
@@ -162,6 +180,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.pages[key] = page
         self._hosts[key].pack_start(page, True, True, 0)
         self._hosts[key].show_all()
+        if self.active_host and not getattr(self.active_host, 'connected', True):
+            self._ssh_state_changed(self.active_host, 'disconnected', 'SSH disconnected')
 
     def _finish_page_switch(self, _notebook, _page, number):
         page = self.pages.get(self._page_keys[number])
@@ -212,9 +232,6 @@ class MainWindow(Gtk.ApplicationWindow):
             text.set_margin_top(7)
             text.set_margin_bottom(7)
             row.add(text)
-            if index is not None:
-                profile = self.app.config['hosts'][index]
-                row.set_tooltip_text(f"{profile['username']}@{profile['hostname']}:{profile['port']}")
             self.host_list.add(row)
         rows = self.host_list.get_children()
         position = self._profile_index + 1 if self._profile_index is not None else 0
@@ -234,7 +251,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.connect_host_button.set_sensitive(remote or connecting)
         self.connect_host_button.set_label('Cancel connection' if connecting else
                                            'Reconnect' if self.active_host else 'Connect')
-        self.disconnect_host_button.set_sensitive(self.active_host is not None and not connecting)
+        self.disconnect_host_button.set_sensitive(self.active_host is not None and getattr(self.active_host, 'connected', True) and not connecting)
+        self.reconnect_button.set_visible(self.active_host is not None)
+        self.reconnect_button.set_sensitive(not connecting and not self._maintenance_busy())
 
     def _maintenance_busy(self):
         page = self.pages.get('maintenance')
@@ -320,17 +339,24 @@ class MainWindow(Gtk.ApplicationWindow):
             self.toast('Wait for maintenance to finish before disconnecting.')
             return
         if self.active_host and not self._connecting_host:
-            self._use_host(None, None)
+            self.active_host.close()
+            self._ssh_state_changed(self.active_host, 'disconnected', 'SSH session disconnected')
 
     def _connect_profile(self, index):
         if self._connecting_host or self._maintenance_busy():
             return
         from .hosts import SSHHost
         host = SSHHost(self.app.config['hosts'][index])
+        host.state_handler = lambda *args: GLib.idle_add(self._ssh_state_changed, *args)
+        if self._host_context:
+            self._host_context.generation += 1
+        if self.active_host:
+            self._pause_remote_reads()
         self._connecting_host = host
         self._connect_cancelled = False
         self.notebook.set_sensitive(False)
         self.host_label.set_text('Connecting: ' + host.target)
+        self.connection_state.set_text('Reconnecting' if self.active_host else 'Connecting')
         self._host_buttons()
         def connected(result, error):
             if self.app._closing:
@@ -343,6 +369,7 @@ class MainWindow(Gtk.ApplicationWindow):
             if error:
                 host.close()
                 self.host_label.set_text(self.active_host.target if self.active_host else 'Local host')
+                self.connection_state.set_text(('Connected' if getattr(self.active_host, 'connected', False) else 'Disconnected') if self.active_host else 'Local')
                 self.toast('SSH: ' + str(error))
                 if not self._connect_cancelled:
                     dialog = Gtk.MessageDialog(transient_for=self, modal=True,
@@ -353,9 +380,16 @@ class MainWindow(Gtk.ApplicationWindow):
                     dialog.destroy()
                 self._rebuild_hosts()
             else:
-                self._use_host(host, index)
+                old = self.active_host
+                same = old is not None and getattr(old, 'profile', None) and all(old.profile[key] == host.profile[key] for key in ('hostname', 'username', 'port'))
+                if same:
+                    self._rebind_host(host, index)
+                else:
+                    self._use_host(host, index)
                 missing = [name for name in ('journalctl','ip','ss','python3') if not host.which(name)]
                 self.toast('Connected to ' + host.target + (' · Missing: ' + ', '.join(missing) if missing else ''))
+                if host.credential_warning:
+                    self.toast(host.credential_warning)
             self._host_buttons()
             return False
         self.app.run_async(host.connect, connected)
@@ -373,8 +407,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if 'network' in self.pages:
             self.pages['network'].stop_live()
         if self.active_host:
+            self.active_host.state_handler = None
             self.active_host.close()
         self.active_host = host
+        self._remote_stale.clear()
         self._profile_index = index
         self._host_context = HostContext(self.app, host)
         selected_page = max(0, self.notebook.get_current_page())
@@ -401,6 +437,101 @@ class MainWindow(Gtk.ApplicationWindow):
         self._finish_page_switch(self.notebook, self.notebook.get_nth_page(selected_page), selected_page)
         self.notebook.show()
         self.host_label.set_text(host.target if host else 'Local host')
+        self.connection_state.set_text('Connected' if host else 'Local')
+        self._update_connection_notice()
+        self._rebuild_hosts()
+
+    def _pause_remote_reads(self):
+        logs = self.pages.get('logs')
+        if logs:
+            logs.stop_live()
+            logs._busy = False
+            logs._pending_reload = False
+        network = self.pages.get('network')
+        if network:
+            network.live.set_active(False)
+            network.stop_live()
+            network._busy = False
+            network.refresh_btn.set_sensitive(True)
+        overview = self.pages.get('overview')
+        if overview:
+            overview._busy = False
+            overview.refresh_btn.set_sensitive(True)
+
+    def _ssh_state_changed(self, host, state, reason=''):
+        if self.app._closing or host is not self.active_host:
+            return False
+        self.connection_state.set_text('Reconnecting' if self._connecting_host else 'Connected' if state == 'connected' else 'Disconnected')
+        if state == 'disconnected':
+            if self._host_context:
+                self._host_context.generation += 1
+            self._pause_remote_reads()
+            for key in ('logs', 'network', 'overview'):
+                page = self.pages.get(key)
+                if not page:
+                    continue
+                page._remote_stale = True
+                self._remote_stale.add(key)
+                if key == 'logs':
+                    page.count_label.set_text(page.count_label.get_text().split(' · Stale')[0] + ' · Stale remote data')
+                elif key == 'network':
+                    page._last_error = reason or 'SSH disconnected'
+                    page._update_status()
+                else:
+                    page.status.set_text('Stale remote data · SSH disconnected · previous snapshot retained')
+            maintenance = self.pages.get('maintenance')
+            if maintenance and not maintenance._busy:
+                maintenance.status.set_text('SSH disconnected · reconnect before running actions. Previous results retained.')
+                maintenance._refresh_clicked()
+        self._update_connection_notice()
+        self._host_buttons()
+        return False
+
+    def _update_connection_notice(self):
+        if not self.active_host:
+            self.connection_notice.hide()
+            return
+        offline = not getattr(self.active_host, 'connected', True)
+        names = {'logs': 'System logs', 'network': 'Network', 'overview': 'Overview'}
+        stale = ', '.join(names[key] for key in ('logs', 'network', 'overview') if key in self._remote_stale)
+        text = ('SSH disconnected. Reconnect to read current data. ' if offline else '')
+        if stale:
+            text += 'Retained data is stale: ' + stale + '. Refresh or enable Live to update.'
+        if offline:
+            text += ' Maintenance is never repeated automatically; interrupted operations may still be running remotely.'
+        self.connection_notice.set_text(text)
+        self.connection_notice.set_visible(bool(text))
+
+    def remote_fresh(self, key, host):
+        if host is not None and host is self.active_host and getattr(host, 'connected', True):
+            self._remote_stale.discard(key)
+            page = self.pages.get(key)
+            if page:
+                page._remote_stale = False
+            self._update_connection_notice()
+
+    def _rebind_host(self, host, index):
+        old = self.active_host
+        old.state_handler = None
+        self._pause_remote_reads()
+        self._host_context.generation += 1
+        self._host_context.host = host
+        self.active_host = host
+        self._profile_index = index
+        for key, page in self.pages.items():
+            page.host = host
+            if key in ('logs', 'network', 'overview'):
+                page._remote_stale = True
+                self._remote_stale.add(key)
+            if key == 'network':
+                page._details_updated = 0
+            elif key == 'maintenance':
+                page._probing = False
+                page._refresh_clicked()  # Availability only; no action is replayed.
+        old.close()
+        self.host_label.set_text(host.target)
+        self.connection_state.set_text('Connected')
+        self._update_connection_notice()
         self._rebuild_hosts()
 
     def close_hosts(self):
@@ -503,8 +634,8 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _save_layout(self):
-        if self._layout_saved:
-            return
+        if self._layout_saved or self._skip_layout_save:
+            return True
         config = normalized(self.app.config)
         width, height = self._normal_size
         if self.get_mapped() and not self._maximized and not self._fullscreen:
@@ -517,23 +648,55 @@ class MainWindow(Gtk.ApplicationWindow):
         try:
             save_config(config)
         except OSError as exc:
-            self.toast(f'Could not save window layout: {exc}', 'error')
-            return
+            self._layout_save_error = str(exc)[:2000]
+            self.toast(f'Could not save settings: {exc}', 'error')
+            return False
         self.app.config = config
         self._layout_saved = True
+        self._layout_save_error = None
+        return True
+
+    def _save_failure_response(self):
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, destroy_with_parent=True,
+                                   message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.NONE,
+                                   text='Could not save settings')
+        dialog.get_style_context().add_class('app-root')
+        dialog.format_secondary_text('Your latest settings could not be saved. Retry, keep the app open, '
+                                     'or close without saving these changes.\n\n' +
+                                     (self._layout_save_error or 'Settings write failed.'))
+        dialog.add_button('Keep open', Gtk.ResponseType.CANCEL)
+        dialog.add_button('Close without saving', Gtk.ResponseType.REJECT)
+        dialog.add_button('Retry', Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.ACCEPT)
+        try:
+            return dialog.run()
+        finally:
+            dialog.destroy()
 
     def _delete_event(self, *_):
+        if self._close_prompt_active:
+            return True
         maintenance = self.pages.get('maintenance')
         if maintenance is not None and maintenance._busy:
             self.toast('Maintenance is running. Wait for it to finish before closing.')
             return True
-        self._save_layout()
+        self._close_prompt_active = True
+        try:
+            while not self._save_layout():
+                response = self._save_failure_response()
+                if response == Gtk.ResponseType.REJECT:
+                    # Shutdown must honor the choice without another write.
+                    self._skip_layout_save = True
+                    break
+                if response != Gtk.ResponseType.ACCEPT:
+                    return True
+        finally:
+            self._close_prompt_active = False
         self.close_hosts()
         return False
 
     def toast(self, text, state="info", seconds=3):
         self.status.set_text(str(text))
-        self.status.set_tooltip_text(str(text))
 
 
 class SysLogApplication(Gtk.Application):

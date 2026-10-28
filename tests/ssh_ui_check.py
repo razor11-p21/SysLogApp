@@ -37,7 +37,7 @@ class SidebarTests(unittest.TestCase):
         def capture(args,**kwargs):
             if args[0]=='ip':return '[]',False
             if args[0]=='ss':return 'tcp ESTAB 0 0 10.0.0.1:123 192.0.2.1:443\n',False
-            if args[0]=='journalctl':return '{"MESSAGE":"REMOTE","PRIORITY":"6"}',False
+            if args[0]=='journalctl':return '{"MESSAGE":"REMOTE","PRIORITY":"6"}',False,''
             raise AssertionError(args)
         remote.capture=Mock(side_effect=capture)
         try:
@@ -120,6 +120,34 @@ class SidebarTests(unittest.TestCase):
             shortcut('<Control>a')
             self.assertEqual(network.text_access.selected_text(), network.text_access.all_text())
             shortcut('Escape')
+            # A disconnected/reconnected target retains widgets, filters and rows.
+            remote.connected = False
+            window._ssh_state_changed(remote, 'disconnected', 'fixture loss')
+            self.assertEqual(window.connection_state.get_text(), 'Disconnected')
+            self.assertIn('stale', window.connection_notice.get_text())
+            self.assertEqual(network.store[0][2], '10.0.0.1')
+            self.assertFalse(network.live.get_active())
+            remote.resolve_action.reset_mock()
+            self.assertIsNone(maintenance._resolve(None)[0])
+            remote.resolve_action.assert_not_called()
+            replacement = SimpleNamespace(**vars(remote))
+            replacement.connected = True
+            replacement.close = Mock()
+            replacement.state_handler = None
+            network.search.set_text('10.0')
+            pages = dict(window.pages)
+            tab = window.notebook.get_current_page()
+            window._rebind_host(replacement, 0)
+            self.assertEqual(window.notebook.get_current_page(), tab)
+            self.assertEqual(window.pages, pages)
+            self.assertEqual(network.search.get_text(), '10.0')
+            self.assertEqual(network.columns[2].get_fixed_width(), 190)
+            self.assertIs(network.host, replacement)
+            remote.resolve_action.assert_called()  # Availability only.
+            window.remote_fresh('network', replacement)
+            self.assertNotIn('network', window._remote_stale)
+            self.assertIn('logs', window._remote_stale)
+            self.assertFalse(window.pages['logs'].log_scroll.get_overlay_scrolling())
             window._use_host(None,None)
             settle()
             self.assertFalse(previous_context.active)

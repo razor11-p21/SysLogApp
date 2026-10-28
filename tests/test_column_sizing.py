@@ -83,9 +83,29 @@ class ColumnTests(unittest.TestCase):
         page._on_live(button)
         self.assertEqual(page.store.get_sort_column_id(),(page.COL_TIME,Gtk.SortType.ASCENDING))
         page.start_live.assert_called_once_with()
-        page.store.append(['01:00:00','a','Info','first',6,{'__REALTIME_TIMESTAMP':'1000000'}])
-        page.store.append(['02:00:00','b','Info','last',6,{'__REALTIME_TIMESTAMP':'2000000'}])
+        page.store.append(['01:00:00','a','Info','first',6,{'__REALTIME_TIMESTAMP':'1000000'},None])
+        page.store.append(['02:00:00','b','Info','last',6,{'__REALTIME_TIMESTAMP':'2000000'},None])
         page.tree.scroll_to_cell=Mock()
         page._scroll_to_latest()
         self.assertEqual(page.tree.scroll_to_cell.call_args.args[0].to_string(),'1')
         page.destroy()
+
+    def test_column_drag_remembers_width_immediately_and_wraps_once_after_settling(self):
+        page = LogsPage(SimpleNamespace(config={}, run_async=Mock()))
+        window = Gtk.OffscreenWindow()
+        window.set_default_size(1000, 650)
+        window.add(page)
+        window.show_all()
+        self.settle()
+        column = page.tree_columns[page.COL_MESSAGE]
+        renderer = page.tree_renderers[page.COL_MESSAGE]
+        initial_wrap = renderer.get_property('wrap-width')
+        try:
+            for width in (280, 320, 360, 420):
+                column.set_fixed_width(width)
+            self.assertEqual(page.column_sizing.saved_widths()['Message'], 420)
+            self.assertEqual(renderer.get_property('wrap-width'), initial_wrap)
+            self.settle()
+            self.assertEqual(renderer.get_property('wrap-width'), 408)
+        finally:
+            window.destroy()

@@ -24,7 +24,7 @@ class LogDetailsTests(unittest.TestCase):
         self.window.add(self.page)
         self.window.show_all()
         self.row = self.page.store.append(['12:00:00 · Today', 'test.service', 'Info',
-                                           'Selected event', 6, {'MESSAGE': 'Selected event', '_PID': '123'}])
+                                           'Selected event', 6, {'MESSAGE': 'Selected event', '_PID': '123'}, None])
         self.pump_events()
 
     def tearDown(self):

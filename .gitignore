@@ -5,3 +5,9 @@ backups/
 dist/
 dashboard-concept.png
 *.log
+
+# Local automation, credentials and video production assets
+.agents/
+.aws/
+.codex/
+showcase/

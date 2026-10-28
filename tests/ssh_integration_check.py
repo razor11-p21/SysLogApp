@@ -58,7 +58,12 @@ LogLevel ERROR
                    port=port,auth='key',key_file=str(directory/'client')),known_hosts=known)
   host.connect()
   print('Connected',host.connected,'tools',sorted(host.tools))
-  print('Quoted argv',host.capture(['printf','%s',"literal; $(not-a-command) ' quote"])[0])
+  literal="literal; $(not-a-command) ' quote"
+  assert host.capture(['printf','%s',literal])[0]==literal
+  print('Quoted argv preserved literally')
+  text,capped,notice=host.capture(['sh','-c','printf visible; printf "permission diagnostic" >&2'],return_stderr=True)
+  assert text=='visible' and not capped and notice=='permission diagnostic'
+  print('Successful SSH command stderr preserved')
   print('Overview rows',len(host.overview()['rows']))
   data=snapshot(True,host=host)
   print('Network sockets',len(data['sockets'] or []),'errors',data['errors'])
@@ -75,6 +80,8 @@ LogLevel ERROR
   master=host.control
   host.close()
   proc.wait(timeout=5)
+  proc.stdout.close()
+  assert not host.connected and not Path(master).exists()
   print('Disconnected',not host.connected,'control removed',not Path(master).exists(),'stream exited',proc.returncode)
   helper=directory/'fixture-askpass'
   helper.write_text('#!/bin/sh\ncase "$1" in *yes/no*) printf "yes\\n" ;; *) printf "%s\\n" "fixture-passphrase" ;; esac\n')

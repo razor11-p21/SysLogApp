@@ -14,6 +14,22 @@ REQUIRED_COMMANDS = ('journalctl', 'ip', 'ss', 'ssh')
 DEPENDENCY_HINT = 'python3 python3-gi gir1.2-gtk-3.0 systemd iproute2 openssh-client'
 
 
+def dependency_hint(release_path=Path('/etc/os-release')):
+    """Use distro package names without executing shell content from os-release."""
+    try:
+        fields = dict(line.split('=', 1) for line in release_path.read_text().splitlines()
+                      if '=' in line and not line.lstrip().startswith('#'))
+    except OSError:
+        fields = {}
+    family = (fields.get('ID', '') + ' ' + fields.get('ID_LIKE', '')).replace('"', '').replace("'", '').split()
+    if 'fedora' in family:
+        return 'sudo dnf install python3 python3-gobject gtk3 systemd iproute openssh-clients'
+    if any(name in family for name in ('linuxmint', 'ubuntu', 'debian')):
+        return 'sudo apt install ' + DEPENDENCY_HINT
+    return ('Install Python 3.9+, GTK3/PyGObject, journalctl, ip, ss and the OpenSSH '
+            'client with your distribution package manager.')
+
+
 def check_dependencies():
     missing = []
     if sys.version_info < (3, 9):
@@ -26,7 +42,7 @@ def check_dependencies():
         missing.append(f'GTK3/PyGObject ({exc})')
     missing.extend(command for command in REQUIRED_COMMANDS if not shutil.which(command))
     if missing:
-        raise RuntimeError('Missing dependencies: ' + ', '.join(missing) + '\nInstall on Mint/Ubuntu: sudo apt install ' + DEPENDENCY_HINT)
+        raise RuntimeError('Missing dependencies: ' + ', '.join(missing) + '\n' + dependency_hint())
 
 
 def replace_file(target, data, mode):
