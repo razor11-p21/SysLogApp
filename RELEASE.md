@@ -576,7 +576,7 @@ software may still require them.
 Install the generated package using APT so dependencies are resolved:
 
 ```bash
-sudo apt install ./dist/alpha1/syslogapp_2.0.0~alpha1-1_all.deb
+sudo apt install ./dist/alpha1/syslogapp_2.0.0-alpha1-1_all.deb
 ```
 
 Install the matching `syslogapp-cinnamon-applet` package only on Cinnamon if wanted.

@@ -10,10 +10,10 @@ Ubuntu, Debian and Fedora still need native validation. See
 
 ### Quick install (Debian-family desktop)
 
-Download `syslogapp_2.0.0~alpha1-1_all.deb` from the release, then run:
+Download `syslogapp_2.0.0-alpha1-1_all.deb` from the release, then run:
 
 ```bash
-sudo apt install ./syslogapp_2.0.0~alpha1-1_all.deb
+sudo apt install ./syslogapp_2.0.0-alpha1-1_all.deb
 syslogapp
 ```
 

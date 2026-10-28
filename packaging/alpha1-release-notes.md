@@ -14,10 +14,10 @@ First public alpha of SysLogApp, a terminal-style GTK3 desktop app for systemd-b
 
 ## Downloads and installation
 
-Download the main `syslogapp_2.0.0~alpha1-1_all.deb` for a Debian-family desktop, then:
+Download the main `syslogapp_2.0.0-alpha1-1_all.deb` for a Debian-family desktop, then:
 
 ```bash
-sudo apt install ./syslogapp_2.0.0~alpha1-1_all.deb
+sudo apt install ./syslogapp_2.0.0-alpha1-1_all.deb
 syslogapp
 ```
 

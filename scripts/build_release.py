@@ -52,7 +52,8 @@ def package(stage, name, version, maintainer, depends, description, destination)
             path.chmod(0o755)
         elif path != stage / 'usr/bin/syslogapp':
             path.chmod(0o644)
-    output = destination / f'{name}_{version}_all.deb'
+    file_version = re.sub(r'[^A-Za-z0-9._-]', '-', version)
+    output = destination / f'{name}_{file_version}_all.deb'
     subprocess.run(['dpkg-deb', '--root-owner-group', '--build', str(stage), str(output)], check=True)
     return output
 
@@ -104,7 +105,8 @@ def build(draft=False):
         results.append(package(stage, 'syslogapp-cinnamon-applet', version, maintainer,
                                f'syslogapp (= {version}), cinnamon',
                                'optional Cinnamon panel launcher for SysLogApp\n Adds an applet available in Cinnamon Applets settings.\n It does not change panel preferences or enable itself automatically.', destination))
-    archive = destination / f'SysLogApp-{version}-source.tar.gz'
+    file_version = re.sub(r'[^A-Za-z0-9._-]', '-', version)
+    archive = destination / f'SysLogApp-{file_version}-source.tar.gz'
     names = ['LICENSE', 'AUTHORS', 'NOTICE.md', 'README.md', 'RELEASE.md', 'PERFORMANCE.md', 'COMPATIBILITY.md', 'install.sh',
              'uninstall.sh', 'run-preview.sh', 'syslogapp.py', 'syslogapp', 'cinnamon', 'scripts', 'tests', 'packaging']
     def clean(info):
